@@ -206,7 +206,7 @@ def parse_overlay_sheets(wb_path: Path, base_records: list[Equipment]
     wb = xlrd.open_workbook(str(wb_path))
     issues: list[ImportIssue] = []
 
-    by_asset, by_serial = build_equipment_indexes(base_records)
+    by_asset, by_serial, by_import_key = build_equipment_indexes(base_records)
 
     for sheet_name, status_overrides in OVERLAY_SHEETS.items():
         if sheet_name not in wb.sheet_names():
@@ -230,7 +230,7 @@ def parse_overlay_sheets(wb_path: Path, base_records: list[Equipment]
             asset = row.get("asset_number", "").strip()
             serial = row.get("serial_number", "").strip()
 
-            match = resolve_equipment_match(by_asset, by_serial, asset, serial)
+            match = resolve_equipment_match(by_asset, by_serial, by_import_key, asset, serial)
             if match.record is None:
                 issues.append(ImportIssue(
                     issue_type=match.status,

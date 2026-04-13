@@ -2,6 +2,7 @@
 
 from functools import cmp_to_key
 
+from app_config import APP_CONFIG
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QHeaderView, QTableWidget, QTableWidgetItem
@@ -17,8 +18,9 @@ from Code.gui.theme import (
 from Code.utils.equipment_fields import format_age_years
 
 
-COLUMNS = [
+ALL_COLUMNS = [
     ("Asset #", "asset_number", 130),
+    ("Qty", "qty", 70),
     ("Manufacturer", "manufacturer", 120),
     ("Model", "model", 120),
     ("Description", "description", 250),
@@ -42,11 +44,12 @@ class EquipmentTable(QTableWidget):
         super().__init__(parent)
         self._theme_name = theme_name
         self._color_rows_enabled = True
+        self._columns = active_columns()
         self._sort_column = DATA_COL_START
         self._sort_order = Qt.AscendingOrder
 
-        self.setColumnCount(len(COLUMNS) + DATA_COL_START)
-        self.setHorizontalHeaderLabels(["\u2713"] + [column[0] for column in COLUMNS])
+        self.setColumnCount(len(self._columns) + DATA_COL_START)
+        self.setHorizontalHeaderLabels(["\u2713"] + [column[0] for column in self._columns])
         self.setAlternatingRowColors(True)
         self.setSelectionBehavior(QTableWidget.SelectRows)
         self.setSelectionMode(QTableWidget.SingleSelection)
@@ -57,7 +60,7 @@ class EquipmentTable(QTableWidget):
         self.setWordWrap(False)
 
         header_view = self.horizontalHeader()
-        header_view.setStretchLastSection(False)
+        header_view.setStretchLastSection(True)
         header_view.setSectionResizeMode(QHeaderView.Interactive)
         header_view.setMinimumSectionSize(36)
         header_view.setSectionsMovable(False)
@@ -66,17 +69,12 @@ class EquipmentTable(QTableWidget):
         header_view.sectionClicked.connect(self._on_header_clicked)
         header_view.setSortIndicator(self._sort_column, self._sort_order)
 
-        description_index = DATA_COL_START + next(
-            index for index, (_, field, _) in enumerate(COLUMNS)
-            if field == "description"
-        )
-        header_view.setSectionResizeMode(description_index, QHeaderView.Stretch)
-
-        for index, (_, _, width) in enumerate(COLUMNS):
+        for index, (_, _, width) in enumerate(self._columns):
             self.setColumnWidth(index + DATA_COL_START, width)
 
         self.setColumnWidth(VERIFY_COL, 40)
         header_view.setSectionResizeMode(VERIFY_COL, QHeaderView.Fixed)
+        self._apply_default_hidden_columns()
 
     def set_theme_name(self, theme_name: str) -> None:
         """Update the theme used for row rendering."""
@@ -108,7 +106,7 @@ class EquipmentTable(QTableWidget):
                 verify_item.setBackground(row_background)
             self.setItem(row_index, VERIFY_COL, verify_item)
 
-            for column_index, (_, field, _) in enumerate(COLUMNS):
+            for column_index, (_, field, _) in enumerate(self._columns):
                 raw_value = getattr(eq, field, "")
                 if raw_value is None:
                     raw_value = ""
@@ -172,6 +170,12 @@ class EquipmentTable(QTableWidget):
             return None
         return item.data(Qt.UserRole)
 
+    def _apply_default_hidden_columns(self) -> None:
+        """Hide app-configured columns on first render."""
+        hidden_fields = set(getattr(APP_CONFIG, "default_hidden_table_fields", ()))
+        for index, (_, field, _) in enumerate(self._columns):
+            self.setColumnHidden(index + DATA_COL_START, field in hidden_fields)
+
 class SortableTableWidgetItem(QTableWidgetItem):
     """Table item that sorts by an explicit key when available."""
 
@@ -192,13 +196,21 @@ def format_table_value(field: str, raw_value) -> str:
     """Convert raw field values into compact table text."""
     if field == "estimated_age_years":
         return format_age_years(raw_value)
+    if field == "qty":
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError):
+            return str(raw_value).strip()
+        if number.is_integer():
+            return str(int(number))
+        return str(number)
 
     return str(raw_value).strip()
 
 
 def sort_value(field: str, raw_value, display_value: str):
     """Build a stable sort key for table values."""
-    if field == "estimated_age_years":
+    if field in {"estimated_age_years", "qty"}:
         try:
             return (0, float(raw_value))
         except (TypeError, ValueError):
@@ -299,3 +311,16 @@ def _cal_color(theme_name: str, value: str) -> QColor:
 
 def _row_background(theme_name: str, value: str) -> QColor:
     return row_background(theme_name, value)
+
+
+def active_columns() -> list[tuple[str, str, int]]:
+    """Return the active visible columns for the current app variant."""
+    field_order = tuple(getattr(APP_CONFIG, "table_fields", ()))
+    if not field_order:
+        return list(ALL_COLUMNS)
+
+    by_field = {field: (label, field, width) for label, field, width in ALL_COLUMNS}
+    return [by_field[field] for field in field_order if field in by_field]
+
+
+COLUMNS = active_columns()

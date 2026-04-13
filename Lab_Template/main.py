@@ -103,18 +103,20 @@ class StartupSplash(QWidget):
 def _run_initial_import(app: QApplication, conn, splash: StartupSplash):
     """Run the import pipeline on first launch."""
     data_dir = resolve_data_dir()
+    required_files = _expected_source_files()
+    missing = [
+        (name, (data_dir / name).exists())
+        for name in required_files
+    ]
 
-    master = data_dir / MASTER_FILE
-    survey = data_dir / SURVEY_FILE
-
-    if not master.exists() or not survey.exists():
+    if not all(found for _, found in missing):
         splash.set_status("Data files are missing.")
         QMessageBox.warning(
             None,
             "Data Files Missing",
             f"Expected data files not found in:\n{data_dir}\n\n"
-            f"{MASTER_FILE}: {'Found' if master.exists() else 'MISSING'}\n"
-            f"{SURVEY_FILE}: {'Found' if survey.exists() else 'MISSING'}\n\n"
+            + "\n".join(f"{name}: {'Found' if found else 'MISSING'}" for name, found in missing)
+            + "\n\n"
             "The app will start with an empty database.\n"
             "Use 'Import Data' once the files are in place.",
         )
@@ -151,6 +153,13 @@ def _run_initial_import(app: QApplication, conn, splash: StartupSplash):
             "The app will start with an empty database.\n"
             "Check the Data/ folder and try 'Import Data'.",
         )
+
+def _expected_source_files() -> list[str]:
+    """Return the configured Excel sources required for the current app."""
+    files = [MASTER_FILE]
+    if SURVEY_FILE:
+        files.append(SURVEY_FILE)
+    return files
 
 
 if __name__ == "__main__":

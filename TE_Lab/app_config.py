@@ -20,6 +20,15 @@ class AppConfig:
     build_exe_name: str
     master_source_file: str
     survey_source_file: str
+    import_profile: str
+    show_calibration_section: bool
+    enable_record_images: bool
+    enable_project_field: bool
+    show_age_search_actions: bool
+    default_hidden_table_fields: tuple[str, ...]
+    record_label: str
+    table_fields: tuple[str, ...]
+    filter_fields: tuple[str, ...]
     excel_export_filename: str
     html_report_filename: str
     html_report_title: str
@@ -38,6 +47,35 @@ APP_CONFIG = AppConfig(
     build_exe_name="TE_Lab_Equipment.exe",
     master_source_file="Master List of Eng.Equipment - All - 2020.RO.xls",
     survey_source_file="Survey oF Equip In Eng Lab.xlsx",
+    import_profile="te_dual_workbook",
+    show_calibration_section=True,
+    enable_record_images=False,
+    enable_project_field=False,
+    show_age_search_actions=True,
+    default_hidden_table_fields=(),
+    record_label="Equipment",
+    table_fields=(
+        "asset_number",
+        "manufacturer",
+        "model",
+        "description",
+        "estimated_age_years",
+        "lifecycle_status",
+        "working_status",
+        "calibration_status",
+        "location",
+    ),
+    filter_fields=(
+        "asset_number",
+        "manufacturer",
+        "model",
+        "description",
+        "estimated_age_years",
+        "lifecycle_status",
+        "working_status",
+        "calibration_status",
+        "location",
+    ),
     excel_export_filename="TE_Lab_Equipment_Export.xlsx",
     html_report_filename="verified_equipment_report.html",
     html_report_title="TE Lab Test Equipment Age Review",

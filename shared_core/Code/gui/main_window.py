@@ -38,7 +38,7 @@ from Code.db.database import (
 )
 from Code.db.models import Equipment
 from Code.gui.equipment_table import (
-    COLUMNS,
+    active_columns,
     DATA_COL_START,
     VERIFY_COL,
     EquipmentTable,
@@ -64,6 +64,18 @@ QUICK_EDIT_OPTIONS = {
     "calibration_status": ["calibrated", "reference_only", "out_to_cal", "unknown"],
 }
 QUICK_EDIT_SUGGEST_FIELDS = {"manufacturer", "model", "description", "location"}
+ALL_FILTER_SPECS = [
+    ("Asset #", "asset_number", "text"),
+    ("Quantity", "qty", "text"),
+    ("Manufacturer", "manufacturer", "text"),
+    ("Model", "model", "text"),
+    ("Description", "description", "text"),
+    ("Est. Age (Yrs)", "estimated_age_years", "text"),
+    ("Status", "lifecycle_status", "combo"),
+    ("Working", "working_status", "combo"),
+    ("Calibration", "calibration_status", "combo"),
+    ("Location", "location", "text"),
+]
 
 
 class MainWindow(QMainWindow):
@@ -73,7 +85,8 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.conn = conn
         self._theme_name = normalize_theme_name(initial_theme_name)
-        self._column_widths = {index + DATA_COL_START: width for index, (_, _, width) in enumerate(COLUMNS)}
+        self._columns = active_columns()
+        self._column_widths = {index + DATA_COL_START: width for index, (_, _, width) in enumerate(self._columns)}
 
         self.setWindowTitle(APP_CONFIG.display_name)
         self._apply_initial_window_size()
@@ -206,17 +219,7 @@ class MainWindow(QMainWindow):
 
         self.column_filters: dict[str, QLineEdit | QComboBox] = {}
 
-        filter_specs = [
-            ("Asset #", "asset_number", "text"),
-            ("Manufacturer", "manufacturer", "text"),
-            ("Model", "model", "text"),
-            ("Description", "description", "text"),
-            ("Est. Age (Yrs)", "estimated_age_years", "text"),
-            ("Status", "lifecycle_status", "combo"),
-            ("Working", "working_status", "combo"),
-            ("Calibration", "calibration_status", "combo"),
-            ("Location", "location", "text"),
-        ]
+        filter_specs = active_filter_specs()
 
         combo_values = {
             "lifecycle_status": ["", "active", "repair", "scrapped", "missing", "rental"],
@@ -348,15 +351,15 @@ class MainWindow(QMainWindow):
         results = search_equipment(
             self.conn,
             query,
-            lifecycle=filters["lifecycle_status"],
-            calibration=filters["calibration_status"],
-            working=filters["working_status"],
-            location=filters["location"],
-            asset_number=filters["asset_number"],
-            manufacturer=filters["manufacturer"],
-            model=filters["model"],
-            description=filters["description"],
-            estimated_age_years=filters["estimated_age_years"],
+            lifecycle=filters.get("lifecycle_status", ""),
+            calibration=filters.get("calibration_status", ""),
+            working=filters.get("working_status", ""),
+            location=filters.get("location", ""),
+            asset_number=filters.get("asset_number", ""),
+            manufacturer=filters.get("manufacturer", ""),
+            model=filters.get("model", ""),
+            description=filters.get("description", ""),
+            estimated_age_years=filters.get("estimated_age_years", ""),
         )
         self.table.set_theme_name(self._theme_name)
         self.table.set_color_rows_enabled(self.color_rows_checkbox.isChecked())
@@ -412,7 +415,7 @@ class MainWindow(QMainWindow):
             if not self.table.isColumnHidden(col_idx)
         )
 
-        for col_offset, (label, _, default_width) in enumerate(COLUMNS):
+        for col_offset, (label, _, default_width) in enumerate(self._columns):
             table_col = col_offset + DATA_COL_START
             action = menu.addAction(label)
             action.setCheckable(True)
@@ -460,14 +463,17 @@ class MainWindow(QMainWindow):
 
         quick_edit_action = None
         if column_index >= DATA_COL_START:
-            label, _, _ = COLUMNS[column_index - DATA_COL_START]
+            label, _, _ = self._columns[column_index - DATA_COL_START]
             quick_edit_action = menu.addAction(f"Edit {label}")
 
         open_record_action = menu.addAction("Open Full Record")
         menu.addSeparator()
-        search_online_action = menu.addAction("Search Equipment Online")
-        search_year_action = menu.addAction("Search Equipment Age")
-        copy_info_action = menu.addAction("Copy Age Search")
+        search_online_action = menu.addAction("Search Online")
+        search_year_action = None
+        copy_info_action = None
+        if _show_age_search_actions():
+            search_year_action = menu.addAction("Search Equipment Age")
+            copy_info_action = menu.addAction("Copy Age Search")
         menu.addSeparator()
         delete_action = menu.addAction("Delete Record")
 
@@ -480,9 +486,9 @@ class MainWindow(QMainWindow):
             self._on_edit()
         elif chosen_action == search_online_action:
             self._search_equipment_online(item.row())
-        elif chosen_action == search_year_action:
+        elif search_year_action is not None and chosen_action == search_year_action:
             self._search_equipment_online(item.row(), mode="year")
-        elif chosen_action == copy_info_action:
+        elif copy_info_action is not None and chosen_action == copy_info_action:
             self._copy_equipment_info(item.row())
         elif chosen_action == delete_action:
             self._on_delete()
@@ -496,7 +502,7 @@ class MainWindow(QMainWindow):
         if eq is None:
             return
 
-        label, field, _ = COLUMNS[column_index - DATA_COL_START]
+        label, field, _ = self._columns[column_index - DATA_COL_START]
         current_raw_value = getattr(eq, field, "")
         current_value = self._format_table_value(field, "" if current_raw_value is None else current_raw_value)
 
@@ -529,6 +535,19 @@ class MainWindow(QMainWindow):
         if field == "manufacturer":
             eq.manufacturer_raw = new_value
             eq.manufacturer = normalize_manufacturer(new_value)
+        elif field == "qty":
+            if not new_value:
+                eq.qty = None
+            else:
+                try:
+                    eq.qty = float(new_value)
+                except ValueError:
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Quantity",
+                        "Enter quantity as a number, for example 4 or 4.5.",
+                    )
+                    return
         elif field == "estimated_age_years":
             age_value = parse_age_years(new_value)
             if new_value and age_value is None:
@@ -757,12 +776,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Error", f"HTML export failed:\n{exc}")
 
     def _on_import_data(self) -> None:
+        workbook_label = "source workbook" if not APP_CONFIG.survey_source_file else "source spreadsheets"
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Import Data")
         dialog.setIcon(QMessageBox.Question)
         dialog.setText("Choose what to import into this computer's database.")
         dialog.setInformativeText(
-            "Excel import merges/adds from the source spreadsheets.\n"
+            f"Excel import merges/adds from the {workbook_label}.\n"
             f"Database import copies data from a shared {APP_CONFIG.database_label} file."
         )
         excel_button = dialog.addButton("Merge Excel Files", QMessageBox.AcceptRole)
@@ -777,11 +797,20 @@ class MainWindow(QMainWindow):
             self._on_import_from_db_file()
 
     def _on_reimport_from_excel(self) -> None:
+        if APP_CONFIG.survey_source_file:
+            message = (
+                "This will re-parse both Excel source files and merge them into this computer's database.\n"
+                "Existing records stay in place, matching records are updated conservatively, and new records are added.\n\nContinue?"
+            )
+        else:
+            message = (
+                "This will re-parse the current Excel source workbook and merge it into this computer's database.\n"
+                "Existing records stay in place, matching records are updated conservatively, and new records are added.\n\nContinue?"
+            )
         reply = QMessageBox.question(
             self,
             "Import Data",
-            "This will re-parse both Excel source files and merge them into this computer's database.\n"
-            "Existing records stay in place, matching records are updated conservatively, and new records are added.\n\nContinue?",
+            message,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -862,3 +891,18 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             self.status_bar.showMessage("Ready")
+
+
+def active_filter_specs() -> list[tuple[str, str, str]]:
+    """Return the active filter specs for the current app variant."""
+    field_order = tuple(getattr(APP_CONFIG, "filter_fields", ()))
+    if not field_order:
+        return list(ALL_FILTER_SPECS)
+
+    by_field = {field: (label, field, filter_type) for label, field, filter_type in ALL_FILTER_SPECS}
+    return [by_field[field] for field in field_order if field in by_field]
+
+
+def _show_age_search_actions() -> bool:
+    """Return whether the current app should expose age-search context actions."""
+    return bool(getattr(APP_CONFIG, "show_age_search_actions", True))

@@ -32,9 +32,9 @@ class ImportPipelineTests(unittest.TestCase):
             Equipment(asset_number="A-1", serial_number="S-1"),
             Equipment(asset_number="A-1", serial_number="S-1"),
         ]
-        by_asset, by_serial = build_equipment_indexes(records)
+        by_asset, by_serial, by_import_key = build_equipment_indexes(records)
 
-        match = resolve_equipment_match(by_asset, by_serial, "A-1", "S-1")
+        match = resolve_equipment_match(by_asset, by_serial, by_import_key, "A-1", "S-1")
 
         self.assertIsNone(match.record)
         self.assertEqual(match.status, "conflict")
@@ -45,9 +45,9 @@ class ImportPipelineTests(unittest.TestCase):
             Equipment(asset_number="A-1", serial_number="S-1"),
             Equipment(asset_number="A-1", serial_number="S-2"),
         ]
-        by_asset, by_serial = build_equipment_indexes(records)
+        by_asset, by_serial, by_import_key = build_equipment_indexes(records)
 
-        match = resolve_equipment_match(by_asset, by_serial, "A-1", "S-2")
+        match = resolve_equipment_match(by_asset, by_serial, by_import_key, "A-1", "S-2")
 
         self.assertIs(match.record, records[1])
         self.assertEqual(match.status, "matched")
@@ -234,6 +234,28 @@ class ImportPipelineTests(unittest.TestCase):
         self.assertEqual(counts[0], 1)
         self.assertEqual(raw_cell_count, 1)
         self.assertEqual(issue_count, 1)
+
+    def test_resolve_equipment_match_uses_import_key_when_ids_are_blank(self) -> None:
+        record = Equipment(
+            manufacturer="Cart",
+            source_refs=json.dumps([{
+                "file": MASTER_FILE,
+                "sheet": "Mfg Material",
+                "row": 2,
+                "import_key": "me::mfg_material::1",
+            }]),
+        )
+        by_asset, by_serial, by_import_key = build_equipment_indexes([record])
+
+        match = resolve_equipment_match(
+            by_asset,
+            by_serial,
+            by_import_key,
+            import_key="me::mfg_material::1",
+        )
+
+        self.assertIs(match.record, record)
+        self.assertEqual(match.status, "matched")
 
     def _run_successful_import(self) -> None:
         with patch("Code.importer.pipeline.parse_base_sheet", side_effect=self._fake_base_sheet), \

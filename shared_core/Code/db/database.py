@@ -17,6 +17,7 @@ _SEARCH_TEXT_FIELDS = (
     "manufacturer_raw",
     "model",
     "description",
+    "project_name",
     "location",
     "assigned_to",
     "notes",
@@ -54,12 +55,20 @@ _EQUIPMENT_COPY_COLUMNS = (
     "age_basis",
     "verified_in_survey",
     "blue_dot_ref",
+    "project_name",
+    "picture_path",
     "notes",
     "manual_entry",
     "source_refs",
     "created_at",
     "updated_at",
 )
+_OPTIONAL_ATTACHED_COLUMN_DEFAULTS = {
+    "equipment": {
+        "project_name": "''",
+        "picture_path": "''",
+    },
+}
 _RAW_CELL_COPY_COLUMNS = (
     "id",
     "source_file",
@@ -130,6 +139,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             verified_in_survey INTEGER DEFAULT 0,
             blue_dot_ref       TEXT DEFAULT '',
 
+            project_name       TEXT DEFAULT '',
+            picture_path       TEXT DEFAULT '',
             notes              TEXT DEFAULT '',
             manual_entry       INTEGER DEFAULT 0,
             source_refs        TEXT DEFAULT '[]',
@@ -177,6 +188,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             tokenize='trigram'
         )
     """)
+    _ensure_equipment_column(conn, "project_name", "TEXT DEFAULT ''")
+    _ensure_equipment_column(conn, "picture_path", "TEXT DEFAULT ''")
     _ensure_equipment_search_index(conn)
     conn.commit()
 
@@ -255,7 +268,7 @@ def insert_equipment(
             lifecycle_status, working_status, condition,
             acquired_date, estimated_age_years, age_basis,
             verified_in_survey, blue_dot_ref,
-            notes, manual_entry, source_refs
+            project_name, picture_path, notes, manual_entry, source_refs
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?,
@@ -263,9 +276,9 @@ def insert_equipment(
             ?, ?, ?,
             ?, ?,
             ?, ?, ?,
-            ?, ?, ?,
+            ?, ?, ?, ?,
             ?, ?,
-            ?, ?, ?
+            ?, ?, ?, ?
         )
     """, (
         eq.asset_number, eq.serial_number, eq.manufacturer, eq.manufacturer_raw,
@@ -276,7 +289,7 @@ def insert_equipment(
         eq.lifecycle_status, eq.working_status, eq.condition,
         eq.acquired_date, eq.estimated_age_years, eq.age_basis,
         1 if eq.verified_in_survey else 0, eq.blue_dot_ref,
-        eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
+        eq.project_name, eq.picture_path, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
     ))
     record_id = cur.lastrowid
     _upsert_equipment_search_row(conn, record_id, eq)
@@ -297,7 +310,7 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
             lifecycle_status=?, working_status=?, condition=?,
             acquired_date=?, estimated_age_years=?, age_basis=?,
             verified_in_survey=?, blue_dot_ref=?,
-            notes=?, manual_entry=?, source_refs=?,
+            project_name=?, picture_path=?, notes=?, manual_entry=?, source_refs=?,
             updated_at=datetime('now')
         WHERE record_id=?
     """, (
@@ -309,7 +322,7 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
         eq.lifecycle_status, eq.working_status, eq.condition,
         eq.acquired_date, eq.estimated_age_years, eq.age_basis,
         1 if eq.verified_in_survey else 0, eq.blue_dot_ref,
-        eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
+        eq.project_name, eq.picture_path, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
         eq.record_id,
     ))
     _upsert_equipment_search_row(conn, eq.record_id, eq)
@@ -350,6 +363,7 @@ def get_distinct_equipment_values(
         "manufacturer",
         "model",
         "description",
+        "project_name",
         "location",
         "assigned_to",
         "calibration_vendor",
@@ -568,6 +582,8 @@ def _row_to_equipment(row: sqlite3.Row) -> Equipment:
         age_basis=row["age_basis"] or "unknown",
         verified_in_survey=bool(row["verified_in_survey"]),
         blue_dot_ref=row["blue_dot_ref"] or "",
+        project_name=row["project_name"] or "",
+        picture_path=row["picture_path"] or "",
         notes=row["notes"] or "",
         manual_entry=bool(row["manual_entry"]),
         source_refs=row["source_refs"] or "[]",
@@ -614,13 +630,13 @@ def _search_equipment_with_like(
     search_fields = """(
         asset_number LIKE ? OR serial_number LIKE ? OR
         manufacturer LIKE ? OR manufacturer_raw LIKE ? OR
-        model LIKE ? OR description LIKE ? OR location LIKE ? OR
+        model LIKE ? OR description LIKE ? OR project_name LIKE ? OR location LIKE ? OR
         assigned_to LIKE ? OR notes LIKE ? OR condition LIKE ? OR
         calibration_status LIKE ? OR lifecycle_status LIKE ? OR
         working_status LIKE ? OR calibration_vendor LIKE ? OR
         rental_vendor LIKE ?
     )"""
-    field_count = 15
+    field_count = 16
     conditions = []
     params: list = []
 
@@ -742,6 +758,26 @@ def _ensure_equipment_search_index(conn: sqlite3.Connection) -> None:
         _upsert_equipment_search_row(conn, eq.record_id, eq)
 
 
+def _ensure_equipment_column(conn: sqlite3.Connection, column_name: str, definition: str) -> None:
+    """Add a new equipment column to older databases when needed."""
+    columns = _table_columns(conn, "equipment")
+    if column_name in columns:
+        return
+    conn.execute(f"ALTER TABLE equipment ADD COLUMN {column_name} {definition}")
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    """Return the column names for a local table."""
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    result = set()
+    for row in rows:
+        if isinstance(row, sqlite3.Row):
+            result.add(row["name"])
+        else:
+            result.add(row[1])
+    return result
+
+
 def _attached_table_exists(conn: sqlite3.Connection, database_name: str, table_name: str) -> bool:
     """Return whether an attached database contains the named table."""
     row = conn.execute(
@@ -765,7 +801,12 @@ def _validate_import_source_schema(conn: sqlite3.Connection) -> None:
     if not _attached_table_exists(conn, "import_source", "equipment"):
         raise ValueError(f"Selected file is not a {APP_CONFIG.database_label}.")
 
-    _require_attached_columns(conn, "import_source", "equipment", _EQUIPMENT_COPY_COLUMNS)
+    _require_attached_columns(
+        conn,
+        "import_source",
+        "equipment",
+        _required_attached_columns("equipment", _EQUIPMENT_COPY_COLUMNS),
+    )
 
     if _attached_table_exists(conn, "import_source", "raw_cells"):
         _require_attached_columns(conn, "import_source", "raw_cells", _RAW_CELL_COPY_COLUMNS)
@@ -801,11 +842,23 @@ def _copy_attached_table(
             raise ValueError(f"Selected database is missing the {table_name} table.")
         return
 
+    available_columns = _attached_table_columns(conn, "import_source", table_name)
+    optional_defaults = _OPTIONAL_ATTACHED_COLUMN_DEFAULTS.get(table_name, {})
+    select_columns = []
+    for column in columns:
+        if column in available_columns:
+            select_columns.append(column)
+        elif column in optional_defaults:
+            select_columns.append(f"{optional_defaults[column]} AS {column}")
+        else:
+            raise ValueError(f"Selected database is missing expected columns in {table_name}: {column}")
+
     column_list = ", ".join(columns)
+    select_list = ", ".join(select_columns)
     conn.execute(
         f"""
         INSERT INTO {table_name} ({column_list})
-        SELECT {column_list}
+        SELECT {select_list}
         FROM import_source.{table_name}
         """
     )
@@ -823,3 +876,9 @@ def _can_use_fts(query: str) -> bool:
             return False
 
     return True
+
+
+def _required_attached_columns(table_name: str, columns: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the subset of columns that must exist on an attached table."""
+    optional_columns = set(_OPTIONAL_ATTACHED_COLUMN_DEFAULTS.get(table_name, {}))
+    return tuple(column for column in columns if column not in optional_columns)

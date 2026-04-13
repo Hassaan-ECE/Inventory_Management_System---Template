@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 
+from app_config import APP_CONFIG
 from Code.db.database import (
     clear_all_data, create_tables, get_all_equipment, get_connection,
     insert_equipment, insert_import_issue, insert_raw_cells_batch, update_equipment,
@@ -11,6 +12,7 @@ from Code.importer.matching import build_equipment_indexes, resolve_equipment_ma
 from Code.importer.master_parser import (
     MASTER_FILE, index_all_raw_cells, parse_base_sheet, parse_overlay_sheets,
 )
+from Code.importer.me_parser import index_me_raw_cells, parse_me_workbook
 from Code.importer.normalizer import is_placeholder
 from Code.importer.survey_parser import SURVEY_FILE, index_survey_raw_cells, parse_survey
 
@@ -27,12 +29,9 @@ def run_full_import(data_dir: Path, db_path: Path | None = None,
     Returns a dict with import statistics.
     """
     master_path = data_dir / MASTER_FILE
-    survey_path = data_dir / SURVEY_FILE
 
     if not master_path.exists():
         raise FileNotFoundError(f"Master workbook not found: {master_path}")
-    if not survey_path.exists():
-        raise FileNotFoundError(f"Survey workbook not found: {survey_path}")
 
     conn = get_connection(db_path)
 
@@ -51,6 +50,37 @@ def run_full_import(data_dir: Path, db_path: Path | None = None,
         create_tables(conn)
         conn.execute("BEGIN")
         clear_all_data(conn, commit=False)
+
+        if _import_profile() == "me_single_workbook":
+            _emit(progress_callback, "Parsing", "Reading ME inventory workbook...")
+            imported_records, base_issues = parse_me_workbook(master_path)
+            all_issues.extend(base_issues)
+            stats["base_records"] = len(imported_records)
+
+            _emit(progress_callback, "Saving", "Writing inventory records to database...")
+            for eq in imported_records:
+                insert_equipment(conn, eq, commit=False)
+
+            _emit(progress_callback, "Issues", "Recording import issues...")
+            for issue in all_issues:
+                insert_import_issue(conn, issue, commit=False)
+            stats["total_issues"] = len(all_issues)
+
+            _emit(progress_callback, "Indexing", "Indexing ME workbook cells...")
+            all_cells = index_me_raw_cells(master_path)
+            stats["total_raw_cells"] = len(all_cells)
+
+            batch_size = 5000
+            for i in range(0, len(all_cells), batch_size):
+                insert_raw_cells_batch(conn, all_cells[i:i + batch_size], commit=False)
+
+            conn.commit()
+            _emit(progress_callback, "Done", "Import complete.")
+            return stats
+
+        survey_path = data_dir / SURVEY_FILE
+        if not survey_path.exists():
+            raise FileNotFoundError(f"Survey workbook not found: {survey_path}")
 
         # ── Step 1: Parse base sheet (All Equip) ────────────────────────────
         _emit(progress_callback, "Parsing", "Reading All Equip sheet...")
@@ -117,7 +147,15 @@ def run_full_import(data_dir: Path, db_path: Path | None = None,
 def run_merge_import(data_dir: Path, db_path: Path | None = None,
                      progress_callback=None) -> dict:
     """Parse the current Excel files and merge them into the existing database."""
-    master_path, survey_path = _resolve_import_paths(data_dir)
+    master_path = data_dir / MASTER_FILE
+    if not master_path.exists():
+        raise FileNotFoundError(f"Master workbook not found: {master_path}")
+
+    survey_path = None
+    if _import_profile() != "me_single_workbook":
+        survey_path = data_dir / SURVEY_FILE
+        if not survey_path.exists():
+            raise FileNotFoundError(f"Survey workbook not found: {survey_path}")
     conn = get_connection(db_path)
 
     stats = {
@@ -136,6 +174,54 @@ def run_merge_import(data_dir: Path, db_path: Path | None = None,
 
     try:
         create_tables(conn)
+
+        if _import_profile() == "me_single_workbook":
+            _emit(progress_callback, "Parsing", "Reading ME inventory workbook...")
+            imported_records, base_issues = parse_me_workbook(master_path)
+            all_issues.extend(base_issues)
+            stats["parsed_records"] = len(imported_records)
+
+            combined_records = get_all_equipment(conn)
+            updated_records: dict[int, Equipment] = {}
+
+            _emit(progress_callback, "Merging", "Merging ME workbook into the current database...")
+            new_records = _merge_imported_records(
+                combined_records,
+                imported_records,
+                all_issues,
+                stats,
+                updated_records,
+            )
+            stats["updated_records"] = len(updated_records)
+
+            _emit(progress_callback, "Dedup", "Checking for duplicates in the merged inventory...")
+            _detect_duplicates(combined_records, all_issues)
+
+            _emit(progress_callback, "Indexing", "Indexing ME workbook cells...")
+            all_cells = index_me_raw_cells(master_path)
+            stats["total_raw_cells"] = len(all_cells)
+
+            conn.execute("BEGIN")
+            _delete_import_artifacts(conn, (MASTER_FILE,))
+
+            _emit(progress_callback, "Saving", "Writing merged inventory records to database...")
+            for eq in new_records:
+                insert_equipment(conn, eq, commit=False)
+            for eq in updated_records.values():
+                update_equipment(conn, eq, commit=False)
+
+            _emit(progress_callback, "Issues", "Recording import issues...")
+            for issue in all_issues:
+                insert_import_issue(conn, issue, commit=False)
+            stats["total_issues"] = len(all_issues)
+
+            batch_size = 5000
+            for i in range(0, len(all_cells), batch_size):
+                insert_raw_cells_batch(conn, all_cells[i:i + batch_size], commit=False)
+
+            conn.commit()
+            _emit(progress_callback, "Done", "Excel merge import complete.")
+            return stats
 
         _emit(progress_callback, "Parsing", "Reading All Equip sheet...")
         imported_records, base_issues = parse_base_sheet(master_path)
@@ -219,14 +305,14 @@ def _match_survey(base_records: list[Equipment],
     Updates matched records with blue dot and age info.
     Creates import issues for unmatched survey rows.
     """
-    by_asset, by_serial = build_equipment_indexes(base_records)
+    by_asset, by_serial, by_import_key = build_equipment_indexes(base_records)
 
     for srow in survey_rows:
         asset = srow.get("asset_number", "").strip()
         serial = srow.get("serial_number", "").strip()
         source_row = srow.get("source_row", 0)
 
-        match = resolve_equipment_match(by_asset, by_serial, asset, serial)
+        match = resolve_equipment_match(by_asset, by_serial, by_import_key, asset, serial)
         if match.record is not None:
             matched = match.record
             stats["survey_matched"] = stats.get("survey_matched", 0) + 1
@@ -356,16 +442,23 @@ def _merge_imported_records(
     updated_records: dict[int, Equipment],
 ) -> list[Equipment]:
     """Merge imported equipment rows into the existing in-memory record set."""
-    by_asset, by_serial = build_equipment_indexes(combined_records)
+    by_asset, by_serial, by_import_key = build_equipment_indexes(combined_records)
     new_records: list[Equipment] = []
 
     for imported in imported_records:
-        match = resolve_equipment_match(by_asset, by_serial, imported.asset_number, imported.serial_number)
+        match = resolve_equipment_match(
+            by_asset,
+            by_serial,
+            by_import_key,
+            imported.asset_number,
+            imported.serial_number,
+            imported.primary_import_key(),
+        )
         if match.record is None:
             if match.status == "unmatched":
                 combined_records.append(imported)
                 new_records.append(imported)
-                _index_equipment_record(by_asset, by_serial, imported)
+                _index_equipment_record(by_asset, by_serial, by_import_key, imported)
                 stats["added_records"] = stats.get("added_records", 0) + 1
                 continue
 
@@ -533,15 +626,19 @@ def _add_unique_source_ref(eq: Equipment, file: str, sheet: str, row: int) -> bo
 def _index_equipment_record(
     by_asset: dict[str, list[Equipment]],
     by_serial: dict[str, list[Equipment]],
+    by_import_key: dict[str, list[Equipment]],
     eq: Equipment,
 ) -> None:
     """Add a single equipment record to the existing match indexes."""
     asset_key = eq.asset_number.strip().upper()
     serial_key = eq.serial_number.strip().upper()
+    import_key = eq.primary_import_key().strip().upper()
     if asset_key:
         by_asset.setdefault(asset_key, []).append(eq)
     if serial_key:
         by_serial.setdefault(serial_key, []).append(eq)
+    if import_key:
+        by_import_key.setdefault(import_key, []).append(eq)
 
 
 def _equipment_to_issue_payload(eq: Equipment) -> str:
@@ -572,3 +669,8 @@ def _delete_import_artifacts(conn, source_files: tuple[str, ...]) -> None:
         f"DELETE FROM import_issues WHERE source_file IN ({placeholders})",
         source_files,
     )
+
+
+def _import_profile() -> str:
+    """Return the active workbook import profile for the current app."""
+    return getattr(APP_CONFIG, "import_profile", "te_dual_workbook")

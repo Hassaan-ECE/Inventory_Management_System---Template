@@ -45,6 +45,8 @@ class Equipment:
     blue_dot_ref: str = ""
 
     # Metadata
+    project_name: str = ""
+    picture_path: str = ""
     notes: str = ""
     manual_entry: bool = False
     source_refs: str = "[]"  # JSON string: [{"file": ..., "sheet": ..., "row": ...}]
@@ -59,10 +61,13 @@ class Equipment:
         """Persist parsed source refs back onto the model."""
         self.source_refs = json.dumps(refs)
 
-    def add_source_ref(self, file: str, sheet: str, row: int) -> None:
+    def add_source_ref(self, file: str, sheet: str, row: int, import_key: str = "") -> None:
         """Append a single source reference safely."""
         refs = self.parsed_source_refs()
-        refs.append({"file": file, "sheet": sheet, "row": row})
+        ref = {"file": file, "sheet": sheet, "row": row}
+        if import_key:
+            ref["import_key"] = import_key
+        refs.append(ref)
         self.set_parsed_source_refs(refs)
 
     def first_source_row(self, sheet: str = "All Equip") -> int:
@@ -75,6 +80,14 @@ class Equipment:
             except (TypeError, ValueError):
                 return 0
         return 0
+
+    def primary_import_key(self) -> str:
+        """Return the first stable import key recorded in the source refs."""
+        for ref in self.parsed_source_refs():
+            value = str(ref.get("import_key", "")).strip()
+            if value:
+                return value
+        return ""
 
 
 @dataclass

@@ -17,38 +17,56 @@ class MatchResult:
 
 def build_equipment_indexes(
     records: list[Equipment],
-) -> tuple[dict[str, list[Equipment]], dict[str, list[Equipment]]]:
+) -> tuple[dict[str, list[Equipment]], dict[str, list[Equipment]], dict[str, list[Equipment]]]:
     """Build duplicate-preserving lookup indexes for base equipment records."""
     by_asset: dict[str, list[Equipment]] = defaultdict(list)
     by_serial: dict[str, list[Equipment]] = defaultdict(list)
+    by_import_key: dict[str, list[Equipment]] = defaultdict(list)
 
     for eq in records:
         asset_key = _normalize_key(eq.asset_number)
         serial_key = _normalize_key(eq.serial_number)
+        import_key = _normalize_key(eq.primary_import_key())
         if asset_key:
             by_asset[asset_key].append(eq)
         if serial_key:
             by_serial[serial_key].append(eq)
+        if import_key:
+            by_import_key[import_key].append(eq)
 
-    return dict(by_asset), dict(by_serial)
+    return dict(by_asset), dict(by_serial), dict(by_import_key)
 
 
 def resolve_equipment_match(
     by_asset: dict[str, list[Equipment]],
     by_serial: dict[str, list[Equipment]],
+    by_import_key: dict[str, list[Equipment]] | None = None,
     asset_number: str = "",
     serial_number: str = "",
+    import_key: str = "",
 ) -> MatchResult:
     """Resolve a source row to exactly one equipment record when possible."""
     asset_value = asset_number.strip()
     serial_value = serial_number.strip()
+    import_value = import_key.strip()
     asset_key = _normalize_key(asset_value)
     serial_key = _normalize_key(serial_value)
+    import_lookup = by_import_key or {}
+    import_matches = list(import_lookup.get(_normalize_key(import_value), [])) if import_value else []
+
+    if import_value:
+        if len(import_matches) == 1:
+            return MatchResult(record=import_matches[0], status="matched")
+        if len(import_matches) > 1:
+            return MatchResult(
+                status="conflict",
+                summary=f"matches multiple base records for import key '{import_value}'",
+            )
 
     if not asset_key and not serial_key:
         return MatchResult(
             status="unmatched",
-            summary="does not include an asset number or serial number",
+            summary="does not include an asset number, serial number, or import key",
         )
 
     asset_matches = list(by_asset.get(asset_key, [])) if asset_key else []
