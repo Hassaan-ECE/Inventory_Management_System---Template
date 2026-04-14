@@ -108,6 +108,7 @@ _INV_COLUMNS = [
     ("Description",     "description",          32, "left",   None),
     ("Project",         "project_name",         20, "left",   None),
     ("Location",        "location",             24, "left",   None),
+    ("Links",           "links",                28, "left",   None),
     ("Assigned To",     "assigned_to",          14, "left",   None),
     ("Lifecycle",       "lifecycle_status",      13, "center", "lifecycle"),
     ("Working",         "working_status",        13, "center", "working"),

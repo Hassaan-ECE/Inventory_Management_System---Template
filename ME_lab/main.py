@@ -22,6 +22,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QVBoxLayout, QW
 from Code.db.database import create_tables, get_connection
 from Code.gui.main_window import MainWindow
 from Code.gui.theme import DEFAULT_THEME_NAME, get_stylesheet
+from Code.gui.window_branding import APPLICATION_WINDOW_TITLE, app_icon, apply_window_branding
 from Code.importer.master_parser import MASTER_FILE
 from Code.importer.survey_parser import SURVEY_FILE
 
@@ -29,10 +30,15 @@ from Code.importer.survey_parser import SURVEY_FILE
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_CONFIG.application_name)
+    icon = app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     app.setStyleSheet(get_stylesheet(DEFAULT_THEME_NAME))
 
     splash = StartupSplash()
     splash.show()
+    splash.raise_()
+    app.processEvents()
     splash.set_status("Loading application...")
 
     splash.set_status("Opening database...")
@@ -60,17 +66,18 @@ class StartupSplash(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_CONFIG.display_name)
+        apply_window_branding(self, "Starting Up")
         self.setObjectName("panelCard")
         self.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
-        self.setFixedSize(420, 180)
+        self.setFixedSize(520, 190)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
         layout.setSpacing(10)
 
-        title = QLabel(APP_CONFIG.display_name)
+        title = QLabel(APPLICATION_WINDOW_TITLE)
         title.setObjectName("pageTitle")
+        title.setStyleSheet("font-size: 28px; font-weight: 700;")
         layout.addWidget(title)
 
         subtitle = QLabel("Starting up")

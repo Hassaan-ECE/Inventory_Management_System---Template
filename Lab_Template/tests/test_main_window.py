@@ -28,7 +28,7 @@ class MainWindowSmokeTests(unittest.TestCase):
     def test_window_can_be_created_against_empty_database(self) -> None:
         window = MainWindow(self.conn)
         try:
-            self.assertEqual(window.windowTitle(), "Lab Inventory")
+            self.assertEqual(window.windowTitle(), "Inventory Management System")
         finally:
             window.close()
 

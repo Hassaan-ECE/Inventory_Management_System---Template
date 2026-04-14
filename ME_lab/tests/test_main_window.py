@@ -3,13 +3,16 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QHeaderView
 from PySide6.QtWidgets import QApplication
 
-from Code.db.database import create_tables, get_connection
+from Code.db.database import create_tables, get_connection, insert_equipment
+from Code.db.models import Equipment
 from Code.gui.main_window import MainWindow, active_filter_specs
-from Code.gui.equipment_table import DATA_COL_START
+from Code.gui.equipment_table import DATA_COL_START, LINK_ROLE
 
 
 class MainWindowSmokeTests(unittest.TestCase):
@@ -30,16 +33,20 @@ class MainWindowSmokeTests(unittest.TestCase):
     def test_window_can_be_created_against_empty_database(self) -> None:
         window = MainWindow(self.conn)
         try:
-            self.assertEqual(window.windowTitle(), "ME Lab Inventory")
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+            self.assertEqual(window.windowTitle(), "Inventory Management System")
             headers = [
                 window.table.horizontalHeaderItem(index).text()
                 for index in range(window.table.columnCount())
             ]
             self.assertEqual(
                 headers,
-                ["✓", "Asset #", "Qty", "Manufacturer", "Model", "Description", "Location"],
+                ["✓", "Asset #", "Qty", "Manufacturer", "Model", "Description", "Project", "Location", "Links"],
             )
             self.assertTrue(window.table.isColumnHidden(DATA_COL_START))
+            self.assertTrue(window.table.isColumnHidden(headers.index("Project")))
             self.assertNotIn("Est. Age (Yrs)", headers)
             self.assertNotIn("Status", headers)
             self.assertNotIn("Calibration", headers)
@@ -47,6 +54,35 @@ class MainWindowSmokeTests(unittest.TestCase):
                 [field for _, field, _ in active_filter_specs()],
                 ["asset_number", "manufacturer", "model", "description", "location"],
             )
+            self.assertEqual(
+                window.statusBar().currentMessage(),
+                "Total: 0  |  Verified: 0/0  |  Import Issues: 0",
+            )
+            qty_index = headers.index("Qty")
+            self.assertEqual(window.table.horizontalHeader().sectionViewportPosition(qty_index), 40)
+        finally:
+            window.close()
+
+    def test_qty_starts_at_minimum_width_and_other_me_columns_start_evenly(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            qty_index = headers.index("Qty")
+            other_indices = [headers.index(name) for name in ("Manufacturer", "Model", "Description", "Location", "Links")]
+            other_widths = [window.table.columnWidth(index) for index in other_indices]
+
+            self.assertEqual(
+                window.table.columnWidth(qty_index),
+                window.table._minimum_width_for_column(qty_index),
+            )
+            self.assertLessEqual(max(other_widths) - min(other_widths), 1)
         finally:
             window.close()
 
@@ -68,7 +104,338 @@ class MainWindowSmokeTests(unittest.TestCase):
     def test_last_visible_column_stretches_to_fill_table_width(self) -> None:
         window = MainWindow(self.conn)
         try:
-            self.assertTrue(window.table.horizontalHeader().stretchLastSection())
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            last_visible_index = max(
+                index
+                for index in range(DATA_COL_START, window.table.columnCount())
+                if not window.table.isColumnHidden(index)
+            )
+            self.assertEqual(headers[last_visible_index], "Links")
+            self.assertEqual(
+                window.table.horizontalHeader().sectionResizeMode(last_visible_index),
+                QHeaderView.Fixed,
+            )
+        finally:
+            window.close()
+
+    def test_location_becomes_last_visible_column_when_links_is_hidden(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            links_index = headers.index("Links")
+            location_index = headers.index("Location")
+
+            window._set_column_visible(links_index, False, 220)
+
+            self.assertTrue(window.table.isColumnHidden(links_index))
+            self.assertEqual(
+                window.table.horizontalHeader().sectionResizeMode(location_index),
+                QHeaderView.Fixed,
+            )
+            self.assertEqual(
+                window.table.horizontalHeader().sectionResizeMode(headers.index("Description")),
+                QHeaderView.Interactive,
+            )
+        finally:
+            window.close()
+
+    def test_non_last_column_resize_is_clamped_and_uses_title_based_minimum(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            manufacturer_index = headers.index("Manufacturer")
+            links_index = headers.index("Links")
+            header = window.table.horizontalHeader()
+
+            expected_min_width = max(
+                header.minimumSectionSize(),
+                header.fontMetrics().horizontalAdvance("Manufacturer") + 28,
+            )
+            self.assertEqual(
+                window.table._minimum_width_for_column(manufacturer_index),
+                expected_min_width,
+            )
+
+            window.table.setColumnWidth(manufacturer_index, 4000)
+            self.app.processEvents()
+
+            visible_width = sum(
+                window.table.columnWidth(index)
+                for index in range(window.table.columnCount())
+                if not window.table.isColumnHidden(index)
+            )
+            self.assertLessEqual(visible_width, window.table.viewport().width() + 1)
+            self.assertGreaterEqual(
+                window.table.columnWidth(manufacturer_index),
+                window.table._minimum_width_for_column(manufacturer_index),
+            )
+            self.assertGreaterEqual(
+                window.table.columnWidth(links_index),
+                window.table._minimum_width_for_column(links_index),
+            )
+        finally:
+            window.close()
+
+    def test_short_header_columns_can_use_smaller_minimum_widths(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            qty_index = headers.index("Qty")
+            header = window.table.horizontalHeader()
+            expected_qty_min = max(
+                header.minimumSectionSize(),
+                header.fontMetrics().horizontalAdvance("Qty") + 28,
+            )
+
+            self.assertEqual(window.table._minimum_width_for_column(qty_index), expected_qty_min)
+            self.assertLess(window.table._minimum_width_for_column(qty_index), 72)
+        finally:
+            window.close()
+
+    def test_hidden_asset_column_moves_out_of_the_left_edge(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            asset_index = headers.index("Asset #")
+            qty_index = headers.index("Qty")
+            header = window.table.horizontalHeader()
+
+            self.assertTrue(window.table.isColumnHidden(asset_index))
+            self.assertGreater(header.visualIndex(asset_index), header.visualIndex(qty_index))
+            self.assertEqual(header.sectionViewportPosition(qty_index), 40)
+        finally:
+            window.close()
+
+    def test_verified_column_can_be_hidden(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            qty_index = headers.index("Qty")
+
+            window._set_column_visible(0, False, 40)
+            self.app.processEvents()
+
+            self.assertTrue(window.table.isColumnHidden(0))
+            self.assertEqual(window.table.horizontalHeader().sectionViewportPosition(qty_index), 0)
+        finally:
+            window.close()
+
+    def test_last_data_column_stays_visible_even_if_verified_is_shown(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            visible_data_indices = [
+                index
+                for index in range(DATA_COL_START, window.table.columnCount())
+                if not window.table.isColumnHidden(index)
+            ]
+            last_data_index = visible_data_indices[-1]
+
+            for index in visible_data_indices[:-1]:
+                window._set_column_visible(index, False, window.table.columnWidth(index))
+
+            self.app.processEvents()
+            self.assertFalse(window.table.isColumnHidden(0))
+
+            window._set_column_visible(last_data_index, False, window.table.columnWidth(last_data_index))
+            self.app.processEvents()
+
+            self.assertFalse(window.table.isColumnHidden(last_data_index))
+            self.assertEqual(headers[last_data_index], "Links")
+        finally:
+            window.close()
+
+    def test_last_visible_column_keeps_minimum_width(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            location_index = headers.index("Location")
+            links_index = headers.index("Links")
+
+            window.table.setColumnWidth(location_index, 0)
+            window.table.setColumnWidth(links_index, 0)
+            self.app.processEvents()
+
+            self.assertGreaterEqual(
+                window.table.columnWidth(location_index),
+                window.table._minimum_width_for_column(location_index),
+            )
+            self.assertGreaterEqual(
+                window.table.columnWidth(links_index),
+                window.table._minimum_width_for_column(links_index),
+            )
+        finally:
+            window.close()
+
+    def test_links_cell_shows_hover_hint_and_opens_saved_url(self) -> None:
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ME-200",
+                manufacturer="Fixture Co",
+                description="Fixture cart",
+                location="Storage",
+                links="https://vendor.example/fixture-cart",
+            ),
+        )
+
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            links_index = headers.index("Links")
+            links_item = window.table.item(0, links_index)
+
+            self.assertIsNotNone(links_item)
+            self.assertEqual(links_item.text(), "vendor.example/fixture-cart")
+            self.assertEqual(links_item.data(LINK_ROLE), "https://vendor.example/fixture-cart")
+
+            with patch("Code.gui.main_window.QDesktopServices.openUrl", return_value=True) as open_url:
+                window._open_record_link(0)
+
+            open_url.assert_called_once()
+            self.assertEqual(
+                open_url.call_args.args[0].toString(),
+                "https://vendor.example/fixture-cart",
+            )
+        finally:
+            window.close()
+
+    def test_links_column_shows_shortened_display_for_long_urls(self) -> None:
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ME-201",
+                manufacturer="CEJN",
+                description="QD coupling",
+                location="Storage",
+                links=(
+                    "https://www.cejn.com/en-us/products/thermal-control/"
+                    "?filters=null%3D1191&mtm_campaign=Semicon-Campaign&mtm_content="
+                    "Semicon-Ad-Group-2&mtm_kwd=universal+quick+disconnect+couplings"
+                ),
+            ),
+        )
+
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            links_index = headers.index("Links")
+            links_item = window.table.item(0, links_index)
+
+            self.assertIsNotNone(links_item)
+            self.assertEqual(
+                links_item.text(),
+                "www.cejn.com/en-us/products/thermal-control",
+            )
+            self.assertEqual(
+                links_item.data(LINK_ROLE),
+                (
+                    "https://www.cejn.com/en-us/products/thermal-control/"
+                    "?filters=null%3D1191&mtm_campaign=Semicon-Campaign&mtm_content="
+                    "Semicon-Ad-Group-2&mtm_kwd=universal+quick+disconnect+couplings"
+                ),
+            )
+        finally:
+            window.close()
+
+    def test_links_hover_hint_uses_short_ctrl_click_text(self) -> None:
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ME-202",
+                manufacturer="CEJN",
+                description="QD coupling",
+                location="Storage",
+                links="https://vendor.example/fixture-cart",
+            ),
+        )
+
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            links_index = headers.index("Links")
+            link_rect = window.table.visualItemRect(window.table.item(0, links_index))
+
+            with patch("Code.gui.main_window.QToolTip.showText") as show_text:
+                window._show_link_hover_hint(link_rect.center())
+
+            show_text.assert_called_once()
+            self.assertEqual(show_text.call_args.args[1], "Ctrl+Click to open")
         finally:
             window.close()
 

@@ -35,6 +35,7 @@ class AddEditDialogPictureTests(unittest.TestCase):
             self.assertTrue(hasattr(dialog, "qty_input"))
             self.assertFalse(hasattr(dialog, "age_input"))
             self.assertFalse(hasattr(dialog, "lifecycle_combo"))
+            self.assertFalse(hasattr(dialog, "ownership_combo"))
             self.assertTrue(hasattr(dialog, "picture_browse_btn"))
             self.assertFalse(hasattr(dialog, "picture_clear_btn"))
 
@@ -43,18 +44,21 @@ class AddEditDialogPictureTests(unittest.TestCase):
             dialog.qty_input.setText("4")
             dialog.project_input.setText("AALC Line Upgrade")
             dialog.description_input.setText("Fixture storage cart")
+            dialog.links_input.setText("https://vendor.example/fixture-cart")
             dialog.picture_path_input.setText(r"C:\images\fixture-cart.png")
 
             dialog._on_save()
 
             row = self.conn.execute(
-                "SELECT picture_path, calibration_status, qty, project_name FROM equipment WHERE asset_number='ME-100'"
+                "SELECT picture_path, calibration_status, qty, project_name, links "
+                "FROM equipment WHERE asset_number='ME-100'"
             ).fetchone()
             self.assertIsNotNone(row)
             self.assertEqual(row["picture_path"], r"C:\images\fixture-cart.png")
             self.assertEqual(row["calibration_status"], "unknown")
             self.assertEqual(row["qty"], 4.0)
             self.assertEqual(row["project_name"], "AALC Line Upgrade")
+            self.assertEqual(row["links"], "https://vendor.example/fixture-cart")
 
             dialog.picture_path_input.clear()
             self.assertEqual(dialog.picture_preview.text(), "No picture selected")
@@ -77,6 +81,21 @@ class AddEditDialogPictureTests(unittest.TestCase):
                 Path(open_url.call_args.args[0].toLocalFile()).resolve(),
                 picture_path.resolve(),
             )
+        finally:
+            dialog.close()
+
+    def test_me_dialog_refreshes_picture_preview_after_show(self) -> None:
+        picture_path = Path(self.temp_dir.name) / "fixture.png"
+        picture_path.write_bytes(b"fake-image-bytes")
+        dialog = AddEditDialog(self.conn)
+        try:
+            dialog.picture_path_input.setText(str(picture_path))
+
+            with patch.object(dialog, "_update_picture_preview", wraps=dialog._update_picture_preview) as refresh:
+                dialog.show()
+                self.app.processEvents()
+
+            refresh.assert_called_with(str(picture_path))
         finally:
             dialog.close()
 

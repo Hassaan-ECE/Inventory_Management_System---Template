@@ -47,6 +47,7 @@ class Equipment:
     # Metadata
     project_name: str = ""
     picture_path: str = ""
+    links: str = ""
     notes: str = ""
     manual_entry: bool = False
     source_refs: str = "[]"  # JSON string: [{"file": ..., "sheet": ..., "row": ...}]

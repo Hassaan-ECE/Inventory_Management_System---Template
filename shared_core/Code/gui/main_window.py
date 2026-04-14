@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStatusBar,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +41,7 @@ from Code.db.models import Equipment
 from Code.gui.equipment_table import (
     active_columns,
     DATA_COL_START,
+    LINK_ROLE,
     VERIFY_COL,
     EquipmentTable,
     format_table_value,
@@ -53,6 +55,7 @@ from Code.gui.theme import (
 from Code.gui.quick_edit_dialog import QuickEditDialog
 from Code.gui.search_helpers import build_age_search_query, build_search_query
 from Code.gui.ui_components import CardWidget
+from Code.gui.window_branding import apply_window_branding
 from Code.importer.normalizer import normalize_manufacturer
 from Code.utils.equipment_fields import parse_age_years
 from Code.utils.runtime_paths import bundle_root, executable_dir, is_compiled, resolve_data_dir
@@ -88,13 +91,14 @@ class MainWindow(QMainWindow):
         self._columns = active_columns()
         self._column_widths = {index + DATA_COL_START: width for index, (_, _, width) in enumerate(self._columns)}
 
-        self.setWindowTitle(APP_CONFIG.display_name)
+        apply_window_branding(self)
         self._apply_initial_window_size()
 
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(250)
         self._timer.timeout.connect(self._do_search)
+        self._hovered_link_cell: tuple[int, int] | None = None
 
         self._setup_ui()
         self._do_search()
@@ -121,6 +125,8 @@ class MainWindow(QMainWindow):
         self.resize(width, height)
 
     def _setup_ui(self) -> None:
+        record_label = getattr(APP_CONFIG, "record_label", "Record").strip() or "Record"
+
         central = QWidget()
         self.setCentralWidget(central)
 
@@ -160,7 +166,7 @@ class MainWindow(QMainWindow):
         export_html_btn.clicked.connect(self._on_export_html)
         header.addWidget(export_html_btn)
 
-        add_btn = QPushButton("+ Add Equipment")
+        add_btn = QPushButton(f"+ Add {record_label}")
         add_btn.setObjectName("primaryButton")
         add_btn.clicked.connect(self._on_add)
         header.addWidget(add_btn)
@@ -269,12 +275,14 @@ class MainWindow(QMainWindow):
         table_layout.setSpacing(0)
 
         self.table = EquipmentTable(self._theme_name)
+        self.table.setMouseTracking(True)
 
         header_view = self.table.horizontalHeader()
         header_view.setContextMenuPolicy(Qt.CustomContextMenu)
         header_view.customContextMenuRequested.connect(self._show_header_menu)
 
         self.table.viewport().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.viewport().setMouseTracking(True)
         self.table.viewport().customContextMenuRequested.connect(self._show_cell_menu)
         self.table.viewport().installEventFilter(self)
         self.table.cellClicked.connect(self._on_cell_clicked)
@@ -288,7 +296,7 @@ class MainWindow(QMainWindow):
         self.not_found_label.setObjectName("sectionSubheader")
         self.not_found_row.addWidget(self.not_found_label)
 
-        not_found_btn = QPushButton("Add Equipment")
+        not_found_btn = QPushButton(f"Add {record_label}")
         not_found_btn.setObjectName("primaryButton")
         not_found_btn.clicked.connect(self._on_add)
         self.not_found_row.addWidget(not_found_btn)
@@ -305,9 +313,14 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         """Force a reliable context menu for table cells on right-click."""
-        if watched is self.table.viewport() and event.type() == QEvent.ContextMenu:
-            self._show_cell_menu(event.pos())
-            return True
+        if watched is self.table.viewport():
+            if event.type() == QEvent.ContextMenu:
+                self._show_cell_menu(event.pos())
+                return True
+            if event.type() == QEvent.MouseMove:
+                self._show_link_hover_hint(event.pos())
+            elif event.type() in {QEvent.Leave, QEvent.HoverLeave}:
+                self._clear_link_hover_hint()
         return super().eventFilter(watched, event)
 
     def _schedule_search(self) -> None:
@@ -410,10 +423,19 @@ class MainWindow(QMainWindow):
         header = self.table.horizontalHeader()
         menu = QMenu(self)
 
-        visible_count = sum(
+        visible_data_count = sum(
             1 for col_idx in range(DATA_COL_START, self.table.columnCount())
             if not self.table.isColumnHidden(col_idx)
         )
+        visible_verify = not self.table.isColumnHidden(VERIFY_COL)
+
+        verify_action = menu.addAction("Verified")
+        verify_action.setCheckable(True)
+        verify_action.setChecked(visible_verify)
+        verify_action.toggled.connect(
+            lambda checked: self._set_column_visible(VERIFY_COL, checked, self.table.columnWidth(VERIFY_COL))
+        )
+        menu.addSeparator()
 
         for col_offset, (label, _, default_width) in enumerate(self._columns):
             table_col = col_offset + DATA_COL_START
@@ -421,7 +443,7 @@ class MainWindow(QMainWindow):
             action.setCheckable(True)
             is_visible = not self.table.isColumnHidden(table_col)
             action.setChecked(is_visible)
-            if is_visible and visible_count == 1:
+            if is_visible and visible_data_count == 1:
                 action.setEnabled(False)
             action.toggled.connect(
                 lambda checked, idx=table_col, width=default_width: self._set_column_visible(idx, checked, width)
@@ -430,9 +452,16 @@ class MainWindow(QMainWindow):
         menu.exec(header.mapToGlobal(position))
 
     def _set_column_visible(self, column_index: int, visible: bool, default_width: int) -> None:
-        """Toggle a table column while preserving at least one visible column."""
+        """Toggle a table column while preserving at least one visible data column."""
         currently_visible = not self.table.isColumnHidden(column_index)
         if currently_visible == visible:
+            return
+
+        visible_data_columns = [
+            index for index in range(DATA_COL_START, self.table.columnCount())
+            if not self.table.isColumnHidden(index)
+        ]
+        if column_index >= DATA_COL_START and not visible and len(visible_data_columns) == 1:
             return
 
         visible_columns = [
@@ -624,6 +653,12 @@ class MainWindow(QMainWindow):
         """Handle single clicks on the verify action column."""
         if column == VERIFY_COL:
             self._toggle_verify(row)
+            return
+
+        if column >= DATA_COL_START:
+            _, field, _ = self._columns[column - DATA_COL_START]
+            if field == "links" and QApplication.keyboardModifiers() & Qt.ControlModifier:
+                self._open_record_link(row)
 
     def _equipment_for_row(self, row: int) -> Equipment | None:
         """Fetch the equipment record represented by the given visible row."""
@@ -663,6 +698,64 @@ class MainWindow(QMainWindow):
 
         action_label = "how-old search" if mode == "year" else "web search"
         self.status_bar.showMessage(f"Opened {action_label}: {query}", 4000)
+
+    def _open_record_link(self, row: int) -> None:
+        """Open the saved external link for the selected record."""
+        eq = self._equipment_for_row(row)
+        if eq is None:
+            return
+
+        link_text = (eq.links or "").strip()
+        if not link_text:
+            self.status_bar.showMessage("No link is saved for this record.", 4000)
+            return
+
+        url = QUrl.fromUserInput(link_text)
+        if not url.isValid() or not url.scheme():
+            self.status_bar.showMessage("This link is not in a valid format.", 4000)
+            return
+
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(self, "Open Link", "Could not open the saved link.")
+            return
+
+        self.status_bar.showMessage(f"Opened link: {link_text}", 4000)
+
+    def _show_link_hover_hint(self, position: QPoint) -> None:
+        """Show an immediate hover hint for link cells."""
+        item = self.table.itemAt(position)
+        if item is None:
+            self._clear_link_hover_hint()
+            return
+
+        column_index = item.column()
+        if column_index < DATA_COL_START:
+            self._clear_link_hover_hint()
+            return
+
+        _, field, _ = self._columns[column_index - DATA_COL_START]
+        link_value = str(item.data(LINK_ROLE) or "").strip()
+        if field != "links" or not link_value:
+            self._clear_link_hover_hint()
+            return
+
+        cell_key = (item.row(), item.column())
+        if self._hovered_link_cell == cell_key:
+            return
+
+        self._hovered_link_cell = cell_key
+        QToolTip.showText(
+            self.table.viewport().mapToGlobal(position),
+            "Ctrl+Click to open",
+            self.table.viewport(),
+        )
+
+    def _clear_link_hover_hint(self) -> None:
+        """Hide the custom hover hint for link cells."""
+        if self._hovered_link_cell is None:
+            return
+        self._hovered_link_cell = None
+        QToolTip.hideText()
 
     def _toggle_verify(self, row: int) -> None:
         """Toggle the verified_in_survey flag for the equipment at this row."""
@@ -778,7 +871,7 @@ class MainWindow(QMainWindow):
     def _on_import_data(self) -> None:
         workbook_label = "source workbook" if not APP_CONFIG.survey_source_file else "source spreadsheets"
         dialog = QMessageBox(self)
-        dialog.setWindowTitle("Import Data")
+        apply_window_branding(dialog, "Import Data")
         dialog.setIcon(QMessageBox.Question)
         dialog.setText("Choose what to import into this computer's database.")
         dialog.setInformativeText(
@@ -881,14 +974,21 @@ class MainWindow(QMainWindow):
     def _update_status_bar(self) -> None:
         try:
             stats = get_equipment_stats(self.conn)
-            self.status_bar.showMessage(
-                f"Total: {stats['total']}  |  "
-                f"Active: {stats['active']}  |  "
-                f"Calibrated: {stats['calibrated']}  |  "
-                f"Repair: {stats['repair']}  |  "
-                f"Scrapped: {stats['scrapped']}  |  "
-                f"Verified: {stats['verified_in_survey']}/{stats['total']}"
-            )
+            if _uses_me_inventory_status():
+                self.status_bar.showMessage(
+                    f"Total: {stats['total']}  |  "
+                    f"Verified: {stats['verified_in_survey']}/{stats['total']}  |  "
+                    f"Import Issues: {stats['import_issues']}"
+                )
+            else:
+                self.status_bar.showMessage(
+                    f"Total: {stats['total']}  |  "
+                    f"Active: {stats['active']}  |  "
+                    f"Calibrated: {stats['calibrated']}  |  "
+                    f"Repair: {stats['repair']}  |  "
+                    f"Scrapped: {stats['scrapped']}  |  "
+                    f"Verified: {stats['verified_in_survey']}/{stats['total']}"
+                )
         except Exception:
             self.status_bar.showMessage("Ready")
 
@@ -906,3 +1006,11 @@ def active_filter_specs() -> list[tuple[str, str, str]]:
 def _show_age_search_actions() -> bool:
     """Return whether the current app should expose age-search context actions."""
     return bool(getattr(APP_CONFIG, "show_age_search_actions", True))
+
+
+def _uses_me_inventory_status() -> bool:
+    """Return whether the current app should use the simplified ME status summary."""
+    return bool(
+        getattr(APP_CONFIG, "enable_project_field", False)
+        and not getattr(APP_CONFIG, "show_calibration_section", True)
+    )

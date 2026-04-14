@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from PySide6.QtGui import QDesktopServices, QPixmap
-from PySide6.QtCore import QEvent, Qt, QUrl
+from PySide6.QtCore import QEvent, QTimer, Qt, QUrl
 from PySide6.QtWidgets import (
     QComboBox,
     QCompleter,
@@ -27,6 +27,7 @@ from app_config import APP_CONFIG
 from Code.db.database import get_distinct_equipment_values, insert_equipment, update_equipment
 from Code.db.models import Equipment
 from Code.gui.ui_components import CardWidget
+from Code.gui.window_branding import apply_window_branding
 from Code.importer.normalizer import normalize_manufacturer
 from Code.utils.equipment_fields import format_age_years, parse_age_years
 
@@ -41,7 +42,8 @@ class AddEditDialog(QDialog):
         self.is_edit = equipment is not None
 
         entity_label = getattr(APP_CONFIG, "record_label", "Equipment")
-        self.setWindowTitle(f"Edit {entity_label}" if self.is_edit else f"Add {entity_label}")
+        title_section = f"Edit {entity_label}" if self.is_edit else f"Add {entity_label}"
+        apply_window_branding(self, title_section)
         self.setMinimumSize(920 if self.is_edit else 680, 580)
 
         self._setup_ui()
@@ -203,9 +205,9 @@ class AddEditDialog(QDialog):
         self.assigned_to_input.setPlaceholderText("Person or team using it")
         _add_field(grid, 0, 1, "Used By / Assigned To", self.assigned_to_input)
 
-        self.ownership_combo = QComboBox()
-        self.ownership_combo.addItems(["owned", "rental", "unknown"])
-        _add_field(grid, 2, 0, "Ownership", self.ownership_combo)
+        self.links_input = QLineEdit()
+        self.links_input.setPlaceholderText("Product, vendor, or reference link")
+        _add_field(grid, 2, 0, "Links", self.links_input, colspan=2)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -419,10 +421,12 @@ class AddEditDialog(QDialog):
         self.description_input.setText(eq.description)
         self.location_input.setText(eq.location)
         self.assigned_to_input.setText(eq.assigned_to)
-        _set_combo(self.ownership_combo, eq.ownership_type)
+        if hasattr(self, "ownership_combo"):
+            _set_combo(self.ownership_combo, eq.ownership_type)
         if _uses_me_record_layout():
             self.qty_input.setText(_format_quantity(eq.qty))
             self.project_input.setText(eq.project_name)
+            self.links_input.setText(eq.links)
             self.picture_path_input.setText(eq.picture_path)
             self._update_picture_preview(eq.picture_path)
         else:
@@ -469,6 +473,8 @@ class AddEditDialog(QDialog):
         _add_context_row(layout, "Manual Entry", "Yes" if eq.manual_entry else "No")
         if eq.project_name:
             _add_context_row(layout, "Project", eq.project_name)
+        if eq.links:
+            _add_context_row(layout, "Links", eq.links)
         if eq.picture_path:
             _add_context_row(layout, "Picture", eq.picture_path)
 
@@ -586,6 +592,12 @@ class AddEditDialog(QDialog):
         if hasattr(self, "picture_path_input"):
             self._update_picture_preview(self.picture_path_input.text().strip())
 
+    def showEvent(self, event) -> None:
+        """Refresh the picture preview after the dialog finishes laying out."""
+        super().showEvent(event)
+        if hasattr(self, "picture_path_input"):
+            QTimer.singleShot(0, lambda: self._update_picture_preview(self.picture_path_input.text().strip()))
+
     # ── Save ─────────────────────────────────────────────────────────────────
 
     def _on_save(self) -> None:
@@ -609,7 +621,7 @@ class AddEditDialog(QDialog):
         eq.description = self.description_input.text().strip()
         eq.location = self.location_input.text().strip()
         eq.assigned_to = self.assigned_to_input.text().strip()
-        eq.ownership_type = self.ownership_combo.currentText()
+        eq.ownership_type = self.ownership_combo.currentText() if hasattr(self, "ownership_combo") else "owned"
         if _uses_me_record_layout():
             qty_text = self.qty_input.text().strip()
             if qty_text:
@@ -625,6 +637,7 @@ class AddEditDialog(QDialog):
             else:
                 eq.qty = None
             eq.project_name = self.project_input.text().strip()
+            eq.links = self.links_input.text().strip()
             eq.picture_path = self.picture_path_input.text().strip()
             eq.lifecycle_status = "active"
             eq.working_status = "unknown"

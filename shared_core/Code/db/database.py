@@ -18,6 +18,7 @@ _SEARCH_TEXT_FIELDS = (
     "model",
     "description",
     "project_name",
+    "links",
     "location",
     "assigned_to",
     "notes",
@@ -57,6 +58,7 @@ _EQUIPMENT_COPY_COLUMNS = (
     "blue_dot_ref",
     "project_name",
     "picture_path",
+    "links",
     "notes",
     "manual_entry",
     "source_refs",
@@ -67,6 +69,7 @@ _OPTIONAL_ATTACHED_COLUMN_DEFAULTS = {
     "equipment": {
         "project_name": "''",
         "picture_path": "''",
+        "links": "''",
     },
 }
 _RAW_CELL_COPY_COLUMNS = (
@@ -141,6 +144,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
 
             project_name       TEXT DEFAULT '',
             picture_path       TEXT DEFAULT '',
+            links              TEXT DEFAULT '',
             notes              TEXT DEFAULT '',
             manual_entry       INTEGER DEFAULT 0,
             source_refs        TEXT DEFAULT '[]',
@@ -190,6 +194,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
     """)
     _ensure_equipment_column(conn, "project_name", "TEXT DEFAULT ''")
     _ensure_equipment_column(conn, "picture_path", "TEXT DEFAULT ''")
+    _ensure_equipment_column(conn, "links", "TEXT DEFAULT ''")
     _ensure_equipment_search_index(conn)
     conn.commit()
 
@@ -268,7 +273,7 @@ def insert_equipment(
             lifecycle_status, working_status, condition,
             acquired_date, estimated_age_years, age_basis,
             verified_in_survey, blue_dot_ref,
-            project_name, picture_path, notes, manual_entry, source_refs
+            project_name, picture_path, links, notes, manual_entry, source_refs
         ) VALUES (
             ?, ?, ?, ?,
             ?, ?, ?,
@@ -277,7 +282,7 @@ def insert_equipment(
             ?, ?,
             ?, ?, ?,
             ?, ?, ?, ?,
-            ?, ?,
+            ?, ?, ?,
             ?, ?, ?, ?
         )
     """, (
@@ -289,7 +294,7 @@ def insert_equipment(
         eq.lifecycle_status, eq.working_status, eq.condition,
         eq.acquired_date, eq.estimated_age_years, eq.age_basis,
         1 if eq.verified_in_survey else 0, eq.blue_dot_ref,
-        eq.project_name, eq.picture_path, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
+        eq.project_name, eq.picture_path, eq.links, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
     ))
     record_id = cur.lastrowid
     _upsert_equipment_search_row(conn, record_id, eq)
@@ -310,7 +315,7 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
             lifecycle_status=?, working_status=?, condition=?,
             acquired_date=?, estimated_age_years=?, age_basis=?,
             verified_in_survey=?, blue_dot_ref=?,
-            project_name=?, picture_path=?, notes=?, manual_entry=?, source_refs=?,
+            project_name=?, picture_path=?, links=?, notes=?, manual_entry=?, source_refs=?,
             updated_at=datetime('now')
         WHERE record_id=?
     """, (
@@ -322,7 +327,7 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
         eq.lifecycle_status, eq.working_status, eq.condition,
         eq.acquired_date, eq.estimated_age_years, eq.age_basis,
         1 if eq.verified_in_survey else 0, eq.blue_dot_ref,
-        eq.project_name, eq.picture_path, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
+        eq.project_name, eq.picture_path, eq.links, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
         eq.record_id,
     ))
     _upsert_equipment_search_row(conn, eq.record_id, eq)
@@ -584,6 +589,7 @@ def _row_to_equipment(row: sqlite3.Row) -> Equipment:
         blue_dot_ref=row["blue_dot_ref"] or "",
         project_name=row["project_name"] or "",
         picture_path=row["picture_path"] or "",
+        links=row["links"] or "",
         notes=row["notes"] or "",
         manual_entry=bool(row["manual_entry"]),
         source_refs=row["source_refs"] or "[]",

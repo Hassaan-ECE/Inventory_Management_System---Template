@@ -3,6 +3,8 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QComboBox, QCompleter, QDialog, QDialogButtonBox, QLabel, QLineEdit, QVBoxLayout
 
+from Code.gui.window_branding import apply_window_branding
+
 
 class QuickEditDialog(QDialog):
     """Small field-aware dialog used for quick edits from the results table."""
@@ -16,7 +18,7 @@ class QuickEditDialog(QDialog):
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle(f"Quick Edit: {label}")
+        apply_window_branding(self, f"Quick Edit {label}")
         self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)

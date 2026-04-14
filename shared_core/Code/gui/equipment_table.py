@@ -1,6 +1,7 @@
 """Equipment results table widget and rendering helpers."""
 
 from functools import cmp_to_key
+from urllib.parse import urlparse
 
 from app_config import APP_CONFIG
 from PySide6.QtCore import Qt
@@ -24,17 +25,20 @@ ALL_COLUMNS = [
     ("Manufacturer", "manufacturer", 120),
     ("Model", "model", 120),
     ("Description", "description", 250),
+    ("Project", "project_name", 160),
     ("Est. Age (Yrs)", "estimated_age_years", 105),
     ("Status", "lifecycle_status", 90),
     ("Working", "working_status", 90),
     ("Calibration", "calibration_status", 110),
     ("Location", "location", 160),
+    ("Links", "links", 220),
 ]
 
 VERIFY_COL = 0
 DATA_COL_START = 1
 EMPTY_CELL_TEXT = " - "
 SORT_ROLE = Qt.UserRole + 1
+LINK_ROLE = Qt.UserRole + 2
 
 
 class EquipmentTable(QTableWidget):
@@ -47,6 +51,8 @@ class EquipmentTable(QTableWidget):
         self._columns = active_columns()
         self._sort_column = DATA_COL_START
         self._sort_order = Qt.AscendingOrder
+        self._syncing_header_widths = False
+        self._applied_startup_width_layout = False
 
         self.setColumnCount(len(self._columns) + DATA_COL_START)
         self.setHorizontalHeaderLabels(["\u2713"] + [column[0] for column in self._columns])
@@ -60,21 +66,26 @@ class EquipmentTable(QTableWidget):
         self.setWordWrap(False)
 
         header_view = self.horizontalHeader()
-        header_view.setStretchLastSection(True)
+        header_view.setStretchLastSection(False)
         header_view.setSectionResizeMode(QHeaderView.Interactive)
         header_view.setMinimumSectionSize(36)
         header_view.setSectionsMovable(False)
         header_view.setSectionsClickable(True)
         header_view.setSortIndicatorShown(True)
         header_view.sectionClicked.connect(self._on_header_clicked)
+        header_view.sectionResized.connect(self._on_section_resized)
         header_view.setSortIndicator(self._sort_column, self._sort_order)
 
+        self._column_min_widths = self._build_column_min_widths()
+
         for index, (_, _, width) in enumerate(self._columns):
-            self.setColumnWidth(index + DATA_COL_START, width)
+            column = index + DATA_COL_START
+            self.setColumnWidth(column, max(width, self._minimum_width_for_column(column)))
 
         self.setColumnWidth(VERIFY_COL, 40)
         header_view.setSectionResizeMode(VERIFY_COL, QHeaderView.Fixed)
         self._apply_default_hidden_columns()
+        self._sync_header_resize_modes()
 
     def set_theme_name(self, theme_name: str) -> None:
         """Update the theme used for row rendering."""
@@ -111,10 +122,13 @@ class EquipmentTable(QTableWidget):
                 if raw_value is None:
                     raw_value = ""
                 value = format_table_value(field, raw_value)
-                display_value = value if value else EMPTY_CELL_TEXT
+                display_text = _format_links_display(value) if field == "links" else value
+                display_value = display_text if display_text else EMPTY_CELL_TEXT
                 item = SortableTableWidgetItem(display_value)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 item.set_sort_value(sort_value(field, raw_value, value))
+                if field == "links":
+                    item.setData(LINK_ROLE, value)
 
                 if not value:
                     item.setTextAlignment(Qt.AlignCenter)
@@ -176,6 +190,221 @@ class EquipmentTable(QTableWidget):
         for index, (_, field, _) in enumerate(self._columns):
             self.setColumnHidden(index + DATA_COL_START, field in hidden_fields)
 
+    def setColumnWidth(self, column: int, width: int) -> None:
+        """Clamp visible columns so they never shrink below their header-based minimum."""
+        if hasattr(self, "_column_min_widths") and column >= DATA_COL_START and not self.isColumnHidden(column):
+            width = max(width, self._minimum_width_for_column(column))
+        super().setColumnWidth(column, width)
+
+    def setColumnHidden(self, column: int, hide: bool) -> None:
+        """Keep hidden columns off to the right and visible columns packed left."""
+        super().setColumnHidden(column, hide)
+        self._sync_header_visual_order()
+        self._sync_header_resize_modes()
+
+    def _sync_header_resize_modes(self) -> None:
+        """Lock the last visible data column to the right edge."""
+        header_view = self.horizontalHeader()
+        header_view.setSectionResizeMode(VERIFY_COL, QHeaderView.Fixed)
+
+        visible_data_columns = [
+            column
+            for column in range(DATA_COL_START, self.columnCount())
+            if not self.isColumnHidden(column)
+        ]
+        visible_verify_columns = [] if self.isColumnHidden(VERIFY_COL) else [VERIFY_COL]
+        hidden_verify_columns = [VERIFY_COL] if self.isColumnHidden(VERIFY_COL) else []
+        hidden_data_columns = [
+            column
+            for column in range(DATA_COL_START, self.columnCount())
+            if self.isColumnHidden(column)
+        ]
+        if not visible_data_columns:
+            return
+
+        for column in visible_data_columns[:-1]:
+            header_view.setSectionResizeMode(column, QHeaderView.Interactive)
+
+        header_view.setSectionResizeMode(visible_data_columns[-1], QHeaderView.Fixed)
+        for column in visible_verify_columns:
+            header_view.setSectionResizeMode(column, QHeaderView.Fixed)
+        for column in hidden_verify_columns:
+            header_view.setSectionResizeMode(column, QHeaderView.Fixed)
+        for column in hidden_data_columns:
+            header_view.setSectionResizeMode(column, QHeaderView.Fixed)
+        self._fit_columns_to_viewport()
+
+    def _sync_header_visual_order(self) -> None:
+        """Keep visible data columns in logical order and move hidden ones after them."""
+        header_view = self.horizontalHeader()
+        desired_order = []
+        if not self.isColumnHidden(VERIFY_COL):
+            desired_order.append(VERIFY_COL)
+        desired_order.extend(
+            column
+            for column in range(DATA_COL_START, self.columnCount())
+            if not self.isColumnHidden(column)
+        )
+        if self.isColumnHidden(VERIFY_COL):
+            desired_order.append(VERIFY_COL)
+        desired_order.extend(
+            column
+            for column in range(DATA_COL_START, self.columnCount())
+            if self.isColumnHidden(column)
+        )
+
+        for visual_index, logical_index in enumerate(desired_order):
+            current_index = header_view.visualIndex(logical_index)
+            if current_index != visual_index:
+                header_view.moveSection(current_index, visual_index)
+
+    def resizeEvent(self, event) -> None:
+        """Keep visible columns fitted inside the table viewport."""
+        super().resizeEvent(event)
+        if not self._applied_startup_width_layout and self.viewport().width() > 0:
+            self._apply_startup_width_layout()
+            self._applied_startup_width_layout = True
+        self._fit_columns_to_viewport()
+
+    def _build_column_min_widths(self) -> dict[int, int]:
+        """Compute a minimum width for each data column from its header text."""
+        header_view = self.horizontalHeader()
+        metrics = header_view.fontMetrics()
+        minimum_widths = {VERIFY_COL: 40}
+        base_minimum = header_view.minimumSectionSize()
+        extra_padding = 28
+        for column in range(DATA_COL_START, self.columnCount()):
+            item = self.horizontalHeaderItem(column)
+            title = item.text() if item is not None else ""
+            minimum_widths[column] = max(base_minimum, metrics.horizontalAdvance(title) + extra_padding)
+        return minimum_widths
+
+    def _minimum_width_for_column(self, column: int) -> int:
+        """Return the configured minimum width for a table column."""
+        return self._column_min_widths.get(column, self.horizontalHeader().minimumSectionSize())
+
+    def _apply_startup_width_layout(self) -> None:
+        """Apply the default startup column layout for the current app variant."""
+        if not _uses_me_even_startup_widths():
+            return
+
+        visible_data_columns = [
+            column
+            for column in range(DATA_COL_START, self.columnCount())
+            if not self.isColumnHidden(column)
+        ]
+        if len(visible_data_columns) < 2:
+            return
+
+        qty_column = next(
+            (
+                DATA_COL_START + index
+                for index, (_, field, _) in enumerate(self._columns)
+                if field == "qty" and not self.isColumnHidden(DATA_COL_START + index)
+            ),
+            None,
+        )
+        if qty_column is None:
+            return
+
+        other_columns = [column for column in visible_data_columns if column != qty_column]
+        if not other_columns:
+            return
+
+        verify_width = self.columnWidth(VERIFY_COL) if not self.isColumnHidden(VERIFY_COL) else 0
+        available_width = self.viewport().width() - verify_width
+        if available_width <= 0:
+            return
+
+        qty_width = self._minimum_width_for_column(qty_column)
+        remaining_width = max(0, available_width - qty_width)
+        even_width = remaining_width // len(other_columns)
+
+        self._syncing_header_widths = True
+        try:
+            self.setColumnWidth(qty_column, qty_width)
+            for column in other_columns:
+                self.setColumnWidth(column, max(self._minimum_width_for_column(column), even_width))
+        finally:
+            self._syncing_header_widths = False
+
+    def _on_section_resized(self, section: int, _old_size: int, _new_size: int) -> None:
+        """Clamp column resizes so the table stays within the viewport."""
+        if self._syncing_header_widths or section < DATA_COL_START or self.isColumnHidden(section):
+            return
+        self._fit_columns_to_viewport(preferred_column=section)
+
+    def _fit_columns_to_viewport(self, preferred_column: int | None = None) -> None:
+        """Clamp interactive column widths and pin the last visible column to the viewport edge."""
+        if self._syncing_header_widths:
+            return
+
+        visible_data_columns = [
+            column
+            for column in range(DATA_COL_START, self.columnCount())
+            if not self.isColumnHidden(column)
+        ]
+        if not visible_data_columns:
+            return
+
+        verify_width = self.columnWidth(VERIFY_COL) if not self.isColumnHidden(VERIFY_COL) else 0
+        available_width = self.viewport().width() - verify_width
+        if available_width <= 0:
+            return
+
+        last_visible_column = visible_data_columns[-1]
+        interactive_columns = visible_data_columns[:-1]
+        widths = {
+            column: max(self.columnWidth(column), self._minimum_width_for_column(column))
+            for column in visible_data_columns
+        }
+
+        if preferred_column in interactive_columns:
+            other_width = sum(widths[column] for column in interactive_columns if column != preferred_column)
+            max_width = available_width - other_width - self._minimum_width_for_column(last_visible_column)
+            widths[preferred_column] = min(
+                widths[preferred_column],
+                max(self._minimum_width_for_column(preferred_column), max_width),
+            )
+
+        overflow = (
+            sum(widths[column] for column in interactive_columns)
+            + self._minimum_width_for_column(last_visible_column)
+            - available_width
+        )
+        if overflow > 0:
+            shrink_order = []
+            if preferred_column in interactive_columns:
+                shrink_order.append(preferred_column)
+            shrink_order.extend(
+                column for column in reversed(interactive_columns) if column != preferred_column
+            )
+            for column in shrink_order:
+                shrink_capacity = widths[column] - self._minimum_width_for_column(column)
+                if shrink_capacity <= 0:
+                    continue
+                shrink_amount = min(shrink_capacity, overflow)
+                widths[column] -= shrink_amount
+                overflow -= shrink_amount
+                if overflow <= 0:
+                    break
+
+        trailing_width = available_width - sum(widths[column] for column in interactive_columns)
+        widths[last_visible_column] = max(
+            self._minimum_width_for_column(last_visible_column),
+            trailing_width,
+        )
+
+        self._syncing_header_widths = True
+        try:
+            for column in interactive_columns:
+                if self.columnWidth(column) != widths[column]:
+                    self.setColumnWidth(column, widths[column])
+            if self.columnWidth(last_visible_column) != widths[last_visible_column]:
+                self.setColumnWidth(last_visible_column, widths[last_visible_column])
+        finally:
+            self._syncing_header_widths = False
+
 class SortableTableWidgetItem(QTableWidgetItem):
     """Table item that sorts by an explicit key when available."""
 
@@ -220,6 +449,27 @@ def sort_value(field: str, raw_value, display_value: str):
     if normalized:
         return (0, normalized)
     return (1, "")
+
+
+def _format_links_display(value: str) -> str:
+    """Return a shorter display label for long URLs while preserving the real link elsewhere."""
+    text = value.strip()
+    if not text:
+        return ""
+
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path.rstrip("/")
+        compact = parsed.netloc
+        if path:
+            compact += path
+        if len(compact) <= 54:
+            return compact
+        return f"{compact[:51]}..."
+
+    if len(text) <= 54:
+        return text
+    return f"{text[:51]}..."
 
 
 def _is_blank_sort_item(item: QTableWidgetItem | None) -> bool:
@@ -321,6 +571,14 @@ def active_columns() -> list[tuple[str, str, int]]:
 
     by_field = {field: (label, field, width) for label, field, width in ALL_COLUMNS}
     return [by_field[field] for field in field_order if field in by_field]
+
+
+def _uses_me_even_startup_widths() -> bool:
+    """Return whether the current app should evenly distribute startup widths after Qty."""
+    return bool(
+        getattr(APP_CONFIG, "enable_project_field", False)
+        and not getattr(APP_CONFIG, "show_calibration_section", True)
+    )
 
 
 COLUMNS = active_columns()
