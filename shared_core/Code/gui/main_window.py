@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QStatusBar,
+    QTabBar,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -57,6 +58,13 @@ from Code.gui.search_helpers import build_age_search_query, build_search_query
 from Code.gui.ui_components import CardWidget
 from Code.gui.window_branding import apply_window_branding
 from Code.importer.normalizer import normalize_manufacturer
+from Code.sync.service import (
+    check_for_update,
+    shared_sync_enabled,
+    sync_interval_ms,
+    sync_local_with_shared,
+    update_checks_enabled,
+)
 from Code.utils.equipment_fields import parse_age_years
 from Code.utils.runtime_paths import bundle_root, executable_dir, is_compiled, resolve_data_dir
 
@@ -79,6 +87,8 @@ ALL_FILTER_SPECS = [
     ("Calibration", "calibration_status", "combo"),
     ("Location", "location", "text"),
 ]
+ACTIVE_RECORD_SCOPE = "active"
+ARCHIVED_RECORD_SCOPE = "archived"
 
 
 class MainWindow(QMainWindow):
@@ -90,6 +100,7 @@ class MainWindow(QMainWindow):
         self._theme_name = normalize_theme_name(initial_theme_name)
         self._columns = active_columns()
         self._column_widths = {index + DATA_COL_START: width for index, (_, _, width) in enumerate(self._columns)}
+        self._record_scope = ACTIVE_RECORD_SCOPE
 
         apply_window_branding(self)
         self._apply_initial_window_size()
@@ -99,9 +110,21 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(250)
         self._timer.timeout.connect(self._do_search)
         self._hovered_link_cell: tuple[int, int] | None = None
+        self._pending_sync_timer = QTimer(self)
+        self._pending_sync_timer.setSingleShot(True)
+        self._pending_sync_timer.setInterval(8000)
+        self._pending_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
+        self._periodic_sync_timer = QTimer(self)
+        self._periodic_sync_timer.setInterval(sync_interval_ms())
+        self._periodic_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
+        self._update_prompted_version = ""
 
         self._setup_ui()
         self._do_search()
+        if shared_sync_enabled():
+            self._periodic_sync_timer.start()
+        if shared_sync_enabled() or (update_checks_enabled() and is_compiled()):
+            QTimer.singleShot(1200, self._run_startup_maintenance)
 
     def _apply_initial_window_size(self) -> None:
         """Size the main window to the current display instead of assuming a large monitor."""
@@ -142,6 +165,15 @@ class MainWindow(QMainWindow):
         header.addWidget(title)
         header.addStretch()
 
+        self.view_tabs = QTabBar()
+        self.view_tabs.setDocumentMode(True)
+        self.view_tabs.setDrawBase(False)
+        self.view_tabs.setExpanding(False)
+        self.view_tabs.addTab("Inventory")
+        self.view_tabs.addTab("Archive")
+        self.view_tabs.currentChanged.connect(self._on_view_tab_changed)
+        header.addWidget(self.view_tabs)
+
         self.theme_toggle_btn = QPushButton()
         self.theme_toggle_btn.setObjectName("secondaryButton")
         self.theme_toggle_btn.setMinimumWidth(132)
@@ -180,9 +212,7 @@ class MainWindow(QMainWindow):
         search_layout.setSpacing(10)
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText(
-            'Search equipment — type anything: model, serial, manufacturer, location, "scrapped", "calibrated"...'
-        )
+        self._update_search_placeholder()
         self.search_input.setStyleSheet("font-size: 16px; padding: 14px 18px; border-radius: 12px;")
         self.search_input.textChanged.connect(lambda: self._timer.start())
         self.search_input.returnPressed.connect(self._do_search)
@@ -357,6 +387,110 @@ class MainWindow(QMainWindow):
         self.filter_card.setVisible(checked)
         self.filter_toggle_btn.setText("Hide Filters" if checked else "Filters")
 
+    def _on_view_tab_changed(self, index: int) -> None:
+        """Switch between the main inventory view and the archive view."""
+        self._record_scope = ARCHIVED_RECORD_SCOPE if index == 1 else ACTIVE_RECORD_SCOPE
+        if not hasattr(self, "search_input"):
+            return
+        self._update_search_placeholder()
+        self._do_search()
+
+    def _is_archive_view(self) -> bool:
+        """Return whether the archive view is currently selected."""
+        return self._record_scope == ARCHIVED_RECORD_SCOPE
+
+    def _update_search_placeholder(self) -> None:
+        """Update the search prompt to match the current record scope."""
+        if self._is_archive_view():
+            text = 'Search archived records — manufacturer, model, description, location, or notes'
+        else:
+            text = 'Search equipment — type anything: model, serial, manufacturer, location, "scrapped", "calibrated"...'
+        if hasattr(self, "search_input"):
+            self.search_input.setPlaceholderText(text)
+
+    def _refresh_view_tabs(self) -> None:
+        """Show the current inventory/archive counts on the top view tabs."""
+        stats = get_equipment_stats(self.conn)
+        archived_count = stats.get("archived", 0)
+        inventory_count = max(0, stats.get("total", 0) - archived_count)
+        self.view_tabs.setTabText(0, f"Inventory ({inventory_count})")
+        self.view_tabs.setTabText(1, f"Archive ({archived_count})")
+
+    def _run_startup_maintenance(self) -> None:
+        """Run lightweight startup tasks after the window is visible."""
+        if shared_sync_enabled():
+            self._run_shared_sync(quiet=True)
+        if update_checks_enabled() and is_compiled():
+            self._prompt_for_available_update()
+
+    def _prompt_for_available_update(self) -> None:
+        """Offer the published installer when a newer app version is available."""
+        update_info = check_for_update()
+        if update_info is None or update_info.version == self._update_prompted_version:
+            return
+
+        self._update_prompted_version = update_info.version
+        published_suffix = f"\nPublished: {update_info.published_at}" if update_info.published_at else ""
+        notes_suffix = f"\n\nNotes:\n{update_info.notes}" if update_info.notes else ""
+        reply = QMessageBox.question(
+            self,
+            "Update Available",
+            f"Version {update_info.version} is available for {APP_CONFIG.display_name}.{published_suffix}\n\n"
+            "Open the installer now? The app may need to close before the update can finish."
+            f"{notes_suffix}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        installer_url = QUrl.fromLocalFile(str(update_info.installer_path))
+        if not QDesktopServices.openUrl(installer_url):
+            QMessageBox.warning(
+                self,
+                "Update Available",
+                f"Could not open the installer:\n{update_info.installer_path}",
+            )
+            return
+
+        self.status_bar.showMessage(f"Opened installer for version {update_info.version}.", 5000)
+
+    def _schedule_shared_sync(self) -> None:
+        """Queue a background sync after local changes settle."""
+        if not shared_sync_enabled():
+            return
+        self._pending_sync_timer.start()
+
+    def _run_shared_sync(self, quiet: bool = False) -> None:
+        """Synchronize the local database with the shared workspace."""
+        if not shared_sync_enabled():
+            return
+
+        try:
+            result = sync_local_with_shared(self.conn)
+        except Exception as exc:
+            if quiet:
+                self.status_bar.showMessage(f"Shared sync skipped: {exc}", 5000)
+            else:
+                QMessageBox.warning(self, "Shared Sync", f"Shared sync failed:\n{exc}")
+            return
+
+        if result.pulled or result.initialized == "local":
+            self._do_search()
+            self._update_status_bar()
+        elif result.pushed:
+            self._refresh_view_tabs()
+            self._update_status_bar()
+
+        if result.conflicts:
+            self.status_bar.showMessage(result.message or "Shared sync found conflicts to review.", 7000)
+            return
+
+        if not quiet and result.message:
+            self.status_bar.showMessage(result.message, 5000)
+        elif quiet and (result.pulled or result.pushed or result.initialized):
+            self.status_bar.showMessage(result.message, 5000)
+
     def _do_search(self) -> None:
         """Run the search query and populate the results table."""
         query = self.search_input.text().strip()
@@ -373,26 +507,40 @@ class MainWindow(QMainWindow):
             model=filters.get("model", ""),
             description=filters.get("description", ""),
             estimated_age_years=filters.get("estimated_age_years", ""),
+            archived=self._record_scope,
         )
         self.table.set_theme_name(self._theme_name)
         self.table.set_color_rows_enabled(self.color_rows_checkbox.isChecked())
         self.table.populate(results)
+        self._refresh_view_tabs()
 
         count = len(results)
         has_filters = self._has_active_column_filters()
+        record_label = "archived records" if self._is_archive_view() else "equipment records"
         if not query:
-            if has_filters:
-                self.results_label.setText(f"Showing {count} filtered equipment records")
+            if self._is_archive_view() and count == 0 and not has_filters:
+                self.results_label.setText("No archived records yet")
+            elif has_filters:
+                self.results_label.setText(f"Showing {count} filtered {record_label}")
             else:
-                self.results_label.setText(f"Showing all {count} equipment records")
+                self.results_label.setText(f"Showing all {count} {record_label}")
             self.not_found_widget.hide()
         elif count > 0:
             suffix = " after column filters" if has_filters else ""
-            self.results_label.setText(f'{count} result{"s" if count != 1 else ""} for "{query}"{suffix}')
+            if self._is_archive_view():
+                self.results_label.setText(
+                    f'{count} archived result{"s" if count != 1 else ""} for "{query}"{suffix}'
+                )
+            else:
+                self.results_label.setText(f'{count} result{"s" if count != 1 else ""} for "{query}"{suffix}')
             self.not_found_widget.hide()
         else:
-            self.results_label.setText(f'No results for "{query}"')
-            self.not_found_widget.show()
+            if self._is_archive_view():
+                self.results_label.setText(f'No archived results for "{query}"')
+                self.not_found_widget.hide()
+            else:
+                self.results_label.setText(f'No results for "{query}"')
+                self.not_found_widget.show()
 
     def _current_column_filter_values(self) -> dict[str, str]:
         """Return current per-column filter values in a DB-friendly shape."""
@@ -496,6 +644,7 @@ class MainWindow(QMainWindow):
             quick_edit_action = menu.addAction(f"Edit {label}")
 
         open_record_action = menu.addAction("Open Full Record")
+        archive_action = menu.addAction("Restore Record" if self._is_archive_view() else "Archive Record")
         menu.addSeparator()
         search_online_action = menu.addAction("Search Online")
         search_year_action = None
@@ -513,6 +662,8 @@ class MainWindow(QMainWindow):
             self._quick_edit_cell(item.row(), column_index)
         elif chosen_action == open_record_action:
             self._on_edit()
+        elif chosen_action == archive_action:
+            self._set_row_archived(item.row(), archived=not self._is_archive_view())
         elif chosen_action == search_online_action:
             self._search_equipment_online(item.row())
         elif search_year_action is not None and chosen_action == search_year_action:
@@ -599,6 +750,7 @@ class MainWindow(QMainWindow):
             update_equipment(self.conn, eq)
             self._do_search()
             self._update_status_bar()
+            self._schedule_shared_sync()
         except Exception as exc:
             QMessageBox.critical(self, "Quick Edit Error", f"Failed to update {label}:\n{exc}")
 
@@ -609,6 +761,41 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             self._do_search()
             self._update_status_bar()
+            self._schedule_shared_sync()
+
+    def _set_row_archived(self, row: int, archived: bool) -> None:
+        """Archive or restore the selected record and refresh the current view."""
+        eq = self._equipment_for_row(row)
+        if eq is None or eq.is_archived == archived:
+            return
+
+        title = "Restore Record" if archived is False else "Archive Record"
+        action_label = "restore this record from the archive" if archived is False else "archive this record"
+        detail = (
+            "The record will move back to the main Inventory view."
+            if archived is False
+            else "The record will be removed from Inventory and moved into the Archive view."
+        )
+        reply = QMessageBox.question(
+            self,
+            title,
+            f"Do you want to {action_label}?\n\n{detail}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        eq.is_archived = archived
+        try:
+            update_equipment(self.conn, eq)
+            self._do_search()
+            self._update_status_bar()
+            self._schedule_shared_sync()
+            status = "Record restored from archive." if not archived else "Record archived."
+            self.status_bar.showMessage(status, 3000)
+        except Exception as exc:
+            QMessageBox.critical(self, title, f"Could not update the archive state:\n{exc}")
 
     def _on_edit(self) -> None:
         row = self.table.currentRow()
@@ -628,6 +815,7 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             self._do_search()
             self._update_status_bar()
+            self._schedule_shared_sync()
 
     def _on_delete(self) -> None:
         row = self.table.currentRow()
@@ -648,6 +836,7 @@ class MainWindow(QMainWindow):
             delete_equipment(self.conn, record_id)
             self._do_search()
             self._update_status_bar()
+            self._schedule_shared_sync()
 
     def _on_cell_clicked(self, row: int, column: int) -> None:
         """Handle single clicks on the verify action column."""
@@ -787,6 +976,7 @@ class MainWindow(QMainWindow):
             item.setForeground(verified_color(self._theme_name, False))
 
         self._update_status_bar()
+        self._schedule_shared_sync()
 
     def _copy_equipment_info(self, row: int) -> None:
         """Copy an age-search phrase to the clipboard."""
@@ -917,6 +1107,7 @@ class MainWindow(QMainWindow):
             stats = run_merge_import(data_dir)
             self._do_search()
             self._update_status_bar()
+            self._schedule_shared_sync()
             QMessageBox.information(
                 self,
                 "Import Complete",

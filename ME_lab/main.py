@@ -25,6 +25,7 @@ from Code.gui.theme import DEFAULT_THEME_NAME, get_stylesheet
 from Code.gui.window_branding import APPLICATION_WINDOW_TITLE, app_icon, apply_window_branding
 from Code.importer.master_parser import MASTER_FILE
 from Code.importer.survey_parser import SURVEY_FILE
+from Code.sync.service import shared_sync_enabled, sync_local_with_shared
 
 
 def main():
@@ -45,6 +46,15 @@ def main():
     conn = get_connection()
     splash.set_status("Preparing database...")
     create_tables(conn)
+    if shared_sync_enabled():
+        splash.set_status("Checking shared workspace...")
+        try:
+            sync_result = sync_local_with_shared(conn)
+            if sync_result.message:
+                splash.set_status(sync_result.message)
+                app.processEvents()
+        except Exception:
+            splash.set_status("Shared workspace unavailable. Continuing with local data.")
 
     splash.set_status("Checking inventory records...")
     count = conn.execute("SELECT COUNT(*) FROM equipment").fetchone()[0]

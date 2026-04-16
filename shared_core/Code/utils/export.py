@@ -170,7 +170,7 @@ def _build_inventory_sheet(wb: openpyxl.Workbook, conn) -> None:
 
     _write_header(ws, _INV_COLUMNS)
 
-    equipment = get_all_equipment(conn)
+    equipment = get_all_equipment(conn, archived="active")
     align_map = {"left": _LEFT, "center": _CENTER, "right": _RIGHT}
 
     for r, eq in enumerate(equipment, start=2):
@@ -227,7 +227,7 @@ def _build_summary_sheet(wb: openpyxl.Workbook, conn) -> None:
     ws = wb.create_sheet("Export Summary")
     ws.sheet_properties.tabColor = "10B981"
 
-    stats = get_equipment_stats(conn)
+    stats = get_equipment_stats(conn, archived="active")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     title_font = Font(bold=True, size=16, color="1F2937")

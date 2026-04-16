@@ -33,6 +33,13 @@ class AppConfig:
     html_report_filename: str
     html_report_title: str
     database_label: str
+    app_version: str
+    shared_network_root: str
+    shared_db_filename: str
+    release_manifest_filename: str
+    auto_sync_interval_ms: int
+    enable_shared_sync: bool
+    enable_update_checks: bool
 
 
 APP_CONFIG = AppConfig(
@@ -80,4 +87,11 @@ APP_CONFIG = AppConfig(
     html_report_filename="verified_equipment_report.html",
     html_report_title="TE Lab Test Equipment Age Review",
     database_label="TE Lab Equipment database",
+    app_version="1.0.0",
+    shared_network_root="",
+    shared_db_filename="",
+    release_manifest_filename="current.json",
+    auto_sync_interval_ms=300000,
+    enable_shared_sync=False,
+    enable_update_checks=False,
 )

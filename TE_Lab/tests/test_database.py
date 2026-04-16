@@ -1,5 +1,6 @@
 """Database-layer regression tests."""
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,7 +117,62 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(stats["calibrated"], 1)
         self.assertEqual(stats["reference_only"], 1)
         self.assertEqual(stats["verified_in_survey"], 1)
+        self.assertEqual(stats["archived"], 0)
         self.assertEqual(stats["import_issues"], 1)
+
+    def test_search_equipment_can_switch_between_inventory_and_archive_scopes(self) -> None:
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="INV-100",
+                manufacturer="Fixture Cart",
+                manufacturer_raw="Fixture Cart",
+                description="Current cart",
+            ),
+        )
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ARC-100",
+                manufacturer="Fixture Cart",
+                manufacturer_raw="Fixture Cart",
+                description="Retired cart",
+                is_archived=True,
+            ),
+        )
+
+        active_results = search_equipment(self.conn, "cart")
+        archived_results = search_equipment(self.conn, "cart", archived="archived")
+        all_results = search_equipment(self.conn, "cart", archived="all")
+
+        self.assertEqual([row.asset_number for row in active_results], ["INV-100"])
+        self.assertEqual([row.asset_number for row in archived_results], ["ARC-100"])
+        self.assertEqual([row.asset_number for row in all_results], ["ARC-100", "INV-100"])
+
+    def test_get_equipment_stats_can_report_archive_counts(self) -> None:
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="INV-200",
+                description="Current fixture",
+            ),
+        )
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ARC-200",
+                description="Archived fixture",
+                is_archived=True,
+            ),
+        )
+
+        stats = get_equipment_stats(self.conn)
+        active_stats = get_equipment_stats(self.conn, archived="active")
+
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["archived"], 1)
+        self.assertEqual(active_stats["total"], 1)
+        self.assertEqual(active_stats["archived"], 0)
 
     def test_search_equipment_uses_fts_index_for_long_queries(self) -> None:
         insert_equipment(
@@ -263,6 +319,92 @@ class DatabaseTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].asset_number, "PORT-200")
+
+    def test_create_tables_upgrades_legacy_database_without_archive_column(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy.db"
+        legacy_conn = sqlite3.connect(str(legacy_path))
+        try:
+            legacy_conn.executescript("""
+                CREATE TABLE equipment (
+                    record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_number TEXT DEFAULT '',
+                    serial_number TEXT DEFAULT '',
+                    manufacturer TEXT DEFAULT '',
+                    manufacturer_raw TEXT DEFAULT '',
+                    model TEXT DEFAULT '',
+                    description TEXT DEFAULT '',
+                    qty REAL,
+                    location TEXT DEFAULT '',
+                    assigned_to TEXT DEFAULT '',
+                    ownership_type TEXT DEFAULT 'owned',
+                    rental_vendor TEXT DEFAULT '',
+                    rental_cost_monthly REAL,
+                    calibration_status TEXT DEFAULT 'unknown',
+                    last_calibration_date TEXT DEFAULT '',
+                    calibration_due_date TEXT DEFAULT '',
+                    calibration_vendor TEXT DEFAULT '',
+                    calibration_cost REAL,
+                    lifecycle_status TEXT DEFAULT 'active',
+                    working_status TEXT DEFAULT 'unknown',
+                    condition TEXT DEFAULT '',
+                    acquired_date TEXT DEFAULT '',
+                    estimated_age_years REAL,
+                    age_basis TEXT DEFAULT 'unknown',
+                    verified_in_survey INTEGER DEFAULT 0,
+                    blue_dot_ref TEXT DEFAULT '',
+                    notes TEXT DEFAULT '',
+                    manual_entry INTEGER DEFAULT 0,
+                    source_refs TEXT DEFAULT '[]',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    picture_path TEXT DEFAULT '',
+                    project_name TEXT DEFAULT '',
+                    links TEXT DEFAULT ''
+                );
+                CREATE TABLE raw_cells (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_file TEXT,
+                    source_sheet TEXT,
+                    row_number INTEGER,
+                    column_number INTEGER,
+                    cell_address TEXT,
+                    cell_value TEXT,
+                    row_preview TEXT
+                );
+                CREATE TABLE import_issues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    issue_type TEXT,
+                    source_file TEXT,
+                    source_sheet TEXT,
+                    source_row INTEGER,
+                    asset_number TEXT DEFAULT '',
+                    serial_number TEXT DEFAULT '',
+                    summary TEXT,
+                    raw_data TEXT DEFAULT '{}',
+                    resolution_status TEXT DEFAULT 'unresolved',
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
+            """)
+            legacy_conn.commit()
+        finally:
+            legacy_conn.close()
+
+        upgraded_conn = get_connection(legacy_path)
+        try:
+            create_tables(upgraded_conn)
+            columns = {
+                row["name"]
+                for row in upgraded_conn.execute("PRAGMA table_info(equipment)").fetchall()
+            }
+            indexes = {
+                row["name"]
+                for row in upgraded_conn.execute("PRAGMA index_list(equipment)").fetchall()
+            }
+        finally:
+            upgraded_conn.close()
+
+        self.assertIn("is_archived", columns)
+        self.assertIn("idx_equipment_archived", indexes)
 
 
 if __name__ == "__main__":

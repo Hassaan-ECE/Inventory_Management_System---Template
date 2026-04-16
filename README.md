@@ -1,111 +1,72 @@
 # Inventory Management System
 
-Desktop inventory platform for managing multiple engineering team inventory apps from one shared codebase.
+Shared desktop inventory system for multiple engineering teams built on one reusable `shared_core` codebase.
 
-This repository started from a TE-only equipment manager and is now being organized into a reusable multi-team structure so future variants such as `ME_lab`, `IT_lab`, and others can share the same core code.
+Current development is centered on `ME_lab`. `TE_Lab` is still in the repo as the reference implementation for the older dual-workbook flow, and `Lab_Template` remains the clean starting point for future variants.
 
-## Current Structure
+## Repository Layout
 
 ```text
 Inventory_Management_System/
-├── shared_core/     # Shared database, importer, GUI, reporting, and utility code
-├── TE_Lab/          # Current working TE inventory app
-├── ME_lab/          # ME / machine shop planning notes and future app folder
-├── IT_lab/          # Reserved for a future IT variant
-└── Lab_Template/    # Reusable starter app folder for new variants
+|-- shared_core/    # Shared database, GUI, importer, reporting, and utility code
+|-- ME_lab/         # Active ME / machine shop variant
+|-- TE_Lab/         # TE reference app
+`-- Lab_Template/   # Starter app folder for new variants
 ```
 
-## Repository Goals
+## How The Codebase Is Split
 
-- keep one shared runtime for database, import, GUI, export, and reporting logic
-- keep each lab app small and focused on its own naming, source files, and special rules
-- make it easy to create a new lab variant without copying random old outputs or caches
-- support both local source execution and optional Windows `.exe` builds
+- `shared_core/Code/` owns the reusable runtime: SQLite models, import pipeline, PySide6 GUI, export helpers, and reporting.
+- Each app folder owns the variant-specific config in `app_config.py`, local `Data/`, build script, and tests.
+- `ME_lab` uses a single-workbook import profile.
+- `TE_Lab` uses the older master-plus-survey import flow.
 
-## Shared Core
+## ME Version At A Glance
 
-`shared_core/Code/` contains the reusable application logic:
+`ME_lab` is no longer just a planning folder. It now contains:
 
-- `db/` for SQLite schema, models, CRUD, and search
-- `gui/` for the PySide6 desktop UI
-- `importer/` for Excel parsing and import pipelines
-- `reporting/` for HTML report generation
-- `utils/` for export helpers and runtime path handling
+- a runnable entry point in `ME_lab/main.py`
+- ME-specific app metadata in `ME_lab/app_config.py`
+- the source workbook `ME_lab/Data/Machine Shop Material list.xlsx`
+- the local ME database `ME_lab/Data/me_lab_inventory.db`
+- ME regression tests in `ME_lab/tests/`
+- a Nuitka build script in `ME_lab/build.py`
+- the original requirements notes in `ME_lab/Machine_Shop_Inventory_System.txt`
 
-## Current App Status
+The ME variant currently enables:
 
-### `TE_Lab`
+- single-workbook import via `import_profile="me_single_workbook"`
+- quantity-focused table views
+- project and record-image support in the edit workflow
+- Excel and HTML export configuration
 
-`TE_Lab` is the current working reference app.
+Current implementation note:
 
-It includes:
+- workbook values such as `BOX No.` and workbook picture references are preserved during import, but they are not first-class ME schema columns yet; they are flattened into record notes during import.
 
-- the real app entry point
-- app-specific configuration
-- source Excel files and local database in `Data/`
-- build script for creating a Windows executable
-- regression tests
-
-Run it with:
+## Run The ME App
 
 ```bash
-cd TE_Lab
+cd ME_lab
 pip install -r requirements.txt
 python main.py
 ```
 
-### `ME_lab`
+On first launch, if the ME database is empty, the app imports data from `Data/Machine Shop Material list.xlsx`.
 
-`ME_lab` currently contains the planning brief for the machine shop / mechanical engineering version of the app.
-
-See:
-
-- [ME_lab/README.md](ME_lab/README.md)
-- [ME_lab/Machine_Shop_Inventory_System.txt](ME_lab/Machine_Shop_Inventory_System.txt)
-
-### `Lab_Template`
-
-`Lab_Template` is the clean starter folder for new app variants.
-
-Use it when creating a new lab app so `TE_Lab` can remain a real implementation instead of becoming the template.
-
-## Creating A New Lab App
-
-1. Copy `Lab_Template` to a new folder such as `ME_lab` or `IT_lab`.
-2. Update `app_config.py` with the new app name, file names, export names, and DB environment variable.
-3. Put the expected source files into that app's `Data/` folder.
-4. Run `python main.py`.
-5. Add any lab-specific parsing or UI behavior only if it truly cannot stay in `shared_core`.
-
-## Python Dependencies
-
-Current app dependencies:
-
-- `PySide6`
-- `pandas`
-- `openpyxl`
-- `xlrd`
-
-Install from an app folder such as `TE_Lab/` or `Lab_Template/`:
+## Test And Build ME
 
 ```bash
-pip install -r requirements.txt
+cd ME_lab
+pip install pytest
+python -m pytest tests -q
+python build.py
 ```
 
-## Build Support
-
-App folders can include a `build.py` script for optional Nuitka-based Windows executable builds.
-
-The current working example is:
-
-- [TE_Lab/build.py](TE_Lab/build.py)
-
-The generic starter is:
-
-- [Lab_Template/build.py](Lab_Template/build.py)
+`build.py` creates a Windows executable with Nuitka and packages the app `Data/` folder plus shared GUI assets.
 
 ## Notes
 
-- This repository is intended to be the new shared multi-team home for the inventory system.
-- The older TE-only repo can remain as the historical single-app version.
-- Generated files such as `__pycache__`, build outputs, and local scratch artifacts should stay out of version control.
+- `TE_Lab` is still useful as the most mature reference implementation when shared-core behavior needs comparison.
+- `Lab_Template` should be the base for future variants instead of copying a working lab folder wholesale.
+- Search, database behavior, exports, and most UI logic live in `shared_core`, so cross-variant changes usually belong there.

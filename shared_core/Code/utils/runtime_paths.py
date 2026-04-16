@@ -13,6 +13,9 @@ from app_config import APP_CONFIG
 APP_DIR_NAME = APP_CONFIG.app_dir_name
 DB_FILENAME = APP_CONFIG.db_filename
 DB_PATH_ENV_VAR = APP_CONFIG.db_path_env_var
+SHARED_NETWORK_ROOT = getattr(APP_CONFIG, "shared_network_root", "").strip()
+SHARED_DB_FILENAME = getattr(APP_CONFIG, "shared_db_filename", "").strip()
+RELEASE_MANIFEST_FILENAME = getattr(APP_CONFIG, "release_manifest_filename", "current.json").strip() or "current.json"
 
 
 def bundle_root() -> Path:
@@ -82,3 +85,58 @@ def user_state_dir(create: bool = True) -> Path:
     if create:
         state_dir.mkdir(parents=True, exist_ok=True)
     return state_dir
+
+
+def shared_root_dir() -> Path | None:
+    """Return the configured shared network root for this app variant, if any."""
+    if not SHARED_NETWORK_ROOT:
+        return None
+    return Path(SHARED_NETWORK_ROOT)
+
+
+def shared_database_dir(create: bool = False) -> Path | None:
+    """Return the shared database directory below the network root."""
+    root = shared_root_dir()
+    if root is None:
+        return None
+    path = root / "shared"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def shared_db_path() -> Path | None:
+    """Return the canonical shared database path for this app variant."""
+    if not SHARED_DB_FILENAME:
+        return None
+    directory = shared_database_dir(create=False)
+    if directory is None:
+        return None
+    return directory / SHARED_DB_FILENAME
+
+
+def shared_lock_path() -> Path | None:
+    """Return the lock-file path used to serialize shared sync operations."""
+    directory = shared_database_dir(create=False)
+    if directory is None:
+        return None
+    return directory / "sync.lock"
+
+
+def shared_backup_dir(create: bool = False) -> Path | None:
+    """Return the shared backup directory below the network root."""
+    root = shared_root_dir()
+    if root is None:
+        return None
+    path = root / "backups"
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def shared_release_manifest_path() -> Path | None:
+    """Return the release manifest path used for update checks."""
+    root = shared_root_dir()
+    if root is None:
+        return None
+    return root / RELEASE_MANIFEST_FILENAME

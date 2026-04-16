@@ -6,8 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QHeaderView
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QHeaderView, QMessageBox
 
 from Code.db.database import create_tables, get_connection, insert_equipment
 from Code.db.models import Equipment
@@ -60,6 +59,89 @@ class MainWindowSmokeTests(unittest.TestCase):
             )
             qty_index = headers.index("Qty")
             self.assertEqual(window.table.horizontalHeader().sectionViewportPosition(qty_index), 40)
+        finally:
+            window.close()
+
+    def test_archive_tab_switches_between_inventory_and_archived_records(self) -> None:
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ME-300",
+                manufacturer="Fixture Cart",
+                description="Current fixture cart",
+                location="Storage",
+            ),
+        )
+        insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ME-301",
+                manufacturer="Retired Cart",
+                description="Old fixture cart",
+                location="Archive",
+                is_archived=True,
+            ),
+        )
+
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            headers = [
+                window.table.horizontalHeaderItem(index).text()
+                for index in range(window.table.columnCount())
+            ]
+            manufacturer_index = headers.index("Manufacturer")
+
+            self.assertEqual(window.view_tabs.tabText(0), "Inventory (1)")
+            self.assertEqual(window.view_tabs.tabText(1), "Archive (1)")
+            self.assertEqual(window.table.rowCount(), 1)
+            self.assertEqual(window.table.item(0, manufacturer_index).text(), "Fixture Cart")
+
+            window.view_tabs.setCurrentIndex(1)
+            self.app.processEvents()
+
+            self.assertEqual(window.table.rowCount(), 1)
+            self.assertEqual(window.table.item(0, manufacturer_index).text(), "Retired Cart")
+            self.assertEqual(window.results_label.text(), "Showing all 1 archived records")
+        finally:
+            window.close()
+
+    def test_archive_action_moves_record_out_of_inventory_view(self) -> None:
+        record_id = insert_equipment(
+            self.conn,
+            Equipment(
+                asset_number="ME-302",
+                manufacturer="Fixture Cart",
+                description="Archivable cart",
+                location="Storage",
+            ),
+        )
+
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            with patch("Code.gui.main_window.QMessageBox.question", return_value=QMessageBox.Yes):
+                window._set_row_archived(0, archived=True)
+                self.app.processEvents()
+
+            row = self.conn.execute(
+                "SELECT is_archived FROM equipment WHERE record_id=?",
+                (record_id,),
+            ).fetchone()
+            self.assertEqual(row["is_archived"], 1)
+            self.assertEqual(window.table.rowCount(), 0)
+            self.assertEqual(window.view_tabs.tabText(0), "Inventory (0)")
+            self.assertEqual(window.view_tabs.tabText(1), "Archive (1)")
+
+            window.view_tabs.setCurrentIndex(1)
+            self.app.processEvents()
+            self.assertEqual(window.table.rowCount(), 1)
         finally:
             window.close()
 

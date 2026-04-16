@@ -10,6 +10,7 @@ class Equipment:
     """A normalized equipment record."""
 
     record_id: Optional[int] = None
+    record_uuid: str = ""
     asset_number: str = ""
     serial_number: str = ""
     manufacturer: str = ""
@@ -50,6 +51,7 @@ class Equipment:
     links: str = ""
     notes: str = ""
     manual_entry: bool = False
+    is_archived: bool = False
     source_refs: str = "[]"  # JSON string: [{"file": ..., "sheet": ..., "row": ...}]
     created_at: str = ""
     updated_at: str = ""

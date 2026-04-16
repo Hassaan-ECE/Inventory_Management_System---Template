@@ -2,6 +2,7 @@
 
 import sqlite3
 import string
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +32,7 @@ _SEARCH_TEXT_FIELDS = (
 )
 _EQUIPMENT_COPY_COLUMNS = (
     "record_id",
+    "record_uuid",
     "asset_number",
     "serial_number",
     "manufacturer",
@@ -61,15 +63,18 @@ _EQUIPMENT_COPY_COLUMNS = (
     "links",
     "notes",
     "manual_entry",
+    "is_archived",
     "source_refs",
     "created_at",
     "updated_at",
 )
 _OPTIONAL_ATTACHED_COLUMN_DEFAULTS = {
     "equipment": {
+        "record_uuid": "''",
         "project_name": "''",
         "picture_path": "''",
         "links": "''",
+        "is_archived": "0",
     },
 }
 _RAW_CELL_COPY_COLUMNS = (
@@ -97,11 +102,11 @@ _IMPORT_ISSUE_COPY_COLUMNS = (
 )
 
 
-def get_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+def get_connection(db_path: Optional[Path] = None, use_wal: bool = True) -> sqlite3.Connection:
     """Get a SQLite connection with WAL mode and foreign keys enabled."""
     path = db_path or DB_PATH
     conn = sqlite3.connect(str(path))
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_mode=WAL" if use_wal else "PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.row_factory = sqlite3.Row
     return conn
@@ -112,6 +117,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS equipment (
             record_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_uuid        TEXT DEFAULT '',
             asset_number       TEXT DEFAULT '',
             serial_number      TEXT DEFAULT '',
             manufacturer       TEXT DEFAULT '',
@@ -147,6 +153,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             links              TEXT DEFAULT '',
             notes              TEXT DEFAULT '',
             manual_entry       INTEGER DEFAULT 0,
+            is_archived        INTEGER DEFAULT 0,
             source_refs        TEXT DEFAULT '[]',
             created_at         TEXT DEFAULT (datetime('now')),
             updated_at         TEXT DEFAULT (datetime('now'))
@@ -177,12 +184,30 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at         TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS record_sync_state (
+            record_uuid       TEXT PRIMARY KEY,
+            last_synced_hash  TEXT DEFAULT '',
+            synced_at         TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_conflicts (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_uuid       TEXT DEFAULT '',
+            local_hash        TEXT DEFAULT '',
+            shared_hash       TEXT DEFAULT '',
+            last_synced_hash  TEXT DEFAULT '',
+            summary           TEXT DEFAULT '',
+            created_at        TEXT DEFAULT (datetime('now')),
+            resolved          INTEGER DEFAULT 0
+        );
+
         CREATE INDEX IF NOT EXISTS idx_equipment_asset ON equipment(asset_number);
         CREATE INDEX IF NOT EXISTS idx_equipment_serial ON equipment(serial_number);
         CREATE INDEX IF NOT EXISTS idx_equipment_lifecycle ON equipment(lifecycle_status);
         CREATE INDEX IF NOT EXISTS idx_equipment_cal ON equipment(calibration_status);
         CREATE INDEX IF NOT EXISTS idx_raw_cells_value ON raw_cells(cell_value);
         CREATE INDEX IF NOT EXISTS idx_import_issues_status ON import_issues(resolution_status);
+        CREATE INDEX IF NOT EXISTS idx_sync_conflicts_resolved ON sync_conflicts(resolved);
     """)
     conn.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS equipment_search
@@ -192,9 +217,14 @@ def create_tables(conn: sqlite3.Connection) -> None:
             tokenize='trigram'
         )
     """)
+    _ensure_equipment_column(conn, "record_uuid", "TEXT DEFAULT ''")
     _ensure_equipment_column(conn, "project_name", "TEXT DEFAULT ''")
     _ensure_equipment_column(conn, "picture_path", "TEXT DEFAULT ''")
     _ensure_equipment_column(conn, "links", "TEXT DEFAULT ''")
+    _ensure_equipment_column(conn, "is_archived", "INTEGER DEFAULT 0")
+    _ensure_equipment_record_uuids(conn)
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_equipment_record_uuid ON equipment(record_uuid)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_equipment_archived ON equipment(is_archived)")
     _ensure_equipment_search_index(conn)
     conn.commit()
 
@@ -235,6 +265,7 @@ def import_database_snapshot(conn: sqlite3.Connection, source_db_path: Path) -> 
         _copy_attached_table(conn, "equipment", _EQUIPMENT_COPY_COLUMNS)
         _copy_attached_table(conn, "raw_cells", _RAW_CELL_COPY_COLUMNS, required=source_has_raw_cells)
         _copy_attached_table(conn, "import_issues", _IMPORT_ISSUE_COPY_COLUMNS, required=source_has_import_issues)
+        _ensure_equipment_record_uuids(conn)
         _ensure_equipment_search_index(conn)
 
         stats = {
@@ -265,7 +296,7 @@ def insert_equipment(
     """Insert an equipment record and return the new record_id."""
     cur = conn.execute("""
         INSERT INTO equipment (
-            asset_number, serial_number, manufacturer, manufacturer_raw,
+            record_uuid, asset_number, serial_number, manufacturer, manufacturer_raw,
             model, description, qty,
             location, assigned_to, ownership_type, rental_vendor, rental_cost_monthly,
             calibration_status, last_calibration_date, calibration_due_date,
@@ -273,9 +304,9 @@ def insert_equipment(
             lifecycle_status, working_status, condition,
             acquired_date, estimated_age_years, age_basis,
             verified_in_survey, blue_dot_ref,
-            project_name, picture_path, links, notes, manual_entry, source_refs
+            project_name, picture_path, links, notes, manual_entry, is_archived, source_refs
         ) VALUES (
-            ?, ?, ?, ?,
+            ?, ?, ?, ?, ?,
             ?, ?, ?,
             ?, ?, ?, ?, ?,
             ?, ?, ?,
@@ -283,10 +314,10 @@ def insert_equipment(
             ?, ?, ?,
             ?, ?, ?, ?,
             ?, ?, ?,
-            ?, ?, ?, ?
+            ?, ?, ?, ?, ?
         )
     """, (
-        eq.asset_number, eq.serial_number, eq.manufacturer, eq.manufacturer_raw,
+        _ensure_record_uuid(eq), eq.asset_number, eq.serial_number, eq.manufacturer, eq.manufacturer_raw,
         eq.model, eq.description, eq.qty,
         eq.location, eq.assigned_to, eq.ownership_type, eq.rental_vendor, eq.rental_cost_monthly,
         eq.calibration_status, eq.last_calibration_date, eq.calibration_due_date,
@@ -294,7 +325,13 @@ def insert_equipment(
         eq.lifecycle_status, eq.working_status, eq.condition,
         eq.acquired_date, eq.estimated_age_years, eq.age_basis,
         1 if eq.verified_in_survey else 0, eq.blue_dot_ref,
-        eq.project_name, eq.picture_path, eq.links, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
+        eq.project_name,
+        eq.picture_path,
+        eq.links,
+        eq.notes,
+        1 if eq.manual_entry else 0,
+        1 if eq.is_archived else 0,
+        eq.source_refs,
     ))
     record_id = cur.lastrowid
     _upsert_equipment_search_row(conn, record_id, eq)
@@ -307,7 +344,7 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
     """Update an existing equipment record by record_id."""
     conn.execute("""
         UPDATE equipment SET
-            asset_number=?, serial_number=?, manufacturer=?, manufacturer_raw=?,
+            record_uuid=?, asset_number=?, serial_number=?, manufacturer=?, manufacturer_raw=?,
             model=?, description=?, qty=?,
             location=?, assigned_to=?, ownership_type=?, rental_vendor=?, rental_cost_monthly=?,
             calibration_status=?, last_calibration_date=?, calibration_due_date=?,
@@ -315,11 +352,11 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
             lifecycle_status=?, working_status=?, condition=?,
             acquired_date=?, estimated_age_years=?, age_basis=?,
             verified_in_survey=?, blue_dot_ref=?,
-            project_name=?, picture_path=?, links=?, notes=?, manual_entry=?, source_refs=?,
+            project_name=?, picture_path=?, links=?, notes=?, manual_entry=?, is_archived=?, source_refs=?,
             updated_at=datetime('now')
         WHERE record_id=?
     """, (
-        eq.asset_number, eq.serial_number, eq.manufacturer, eq.manufacturer_raw,
+        _ensure_record_uuid(eq), eq.asset_number, eq.serial_number, eq.manufacturer, eq.manufacturer_raw,
         eq.model, eq.description, eq.qty,
         eq.location, eq.assigned_to, eq.ownership_type, eq.rental_vendor, eq.rental_cost_monthly,
         eq.calibration_status, eq.last_calibration_date, eq.calibration_due_date,
@@ -327,7 +364,13 @@ def update_equipment(conn: sqlite3.Connection, eq: Equipment, commit: bool = Tru
         eq.lifecycle_status, eq.working_status, eq.condition,
         eq.acquired_date, eq.estimated_age_years, eq.age_basis,
         1 if eq.verified_in_survey else 0, eq.blue_dot_ref,
-        eq.project_name, eq.picture_path, eq.links, eq.notes, 1 if eq.manual_entry else 0, eq.source_refs,
+        eq.project_name,
+        eq.picture_path,
+        eq.links,
+        eq.notes,
+        1 if eq.manual_entry else 0,
+        1 if eq.is_archived else 0,
+        eq.source_refs,
         eq.record_id,
     ))
     _upsert_equipment_search_row(conn, eq.record_id, eq)
@@ -350,9 +393,14 @@ def get_equipment_by_id(conn: sqlite3.Connection, record_id: int) -> Optional[Eq
     return _row_to_equipment(row)
 
 
-def get_all_equipment(conn: sqlite3.Connection) -> list[Equipment]:
+def get_all_equipment(conn: sqlite3.Connection, archived: str = "all") -> list[Equipment]:
     """Fetch all equipment records."""
-    rows = conn.execute("SELECT * FROM equipment ORDER BY asset_number").fetchall()
+    where_sql, params = _archive_where_clause(archived)
+    sql = "SELECT * FROM equipment"
+    if where_sql:
+        sql += f" WHERE {where_sql}"
+    sql += " ORDER BY asset_number"
+    rows = conn.execute(sql, params).fetchall()
     return [_row_to_equipment(r) for r in rows]
 
 
@@ -404,6 +452,7 @@ def search_equipment(
     model: str = "",
     description: str = "",
     estimated_age_years: str = "",
+    archived: str = "active",
 ) -> list[Equipment]:
     """Search equipment with multi-word Google-style query.
 
@@ -426,20 +475,22 @@ def search_equipment(
 
     if query and _can_use_fts(query):
         try:
-            rows = _search_equipment_with_fts(conn, query, filters)
+            rows = _search_equipment_with_fts(conn, query, filters, archived=archived)
             if rows:
                 return [_row_to_equipment(r) for r in rows]
         except sqlite3.OperationalError:
             pass
 
-    rows = _search_equipment_with_like(conn, query, filters)
+    rows = _search_equipment_with_like(conn, query, filters, archived=archived)
     return [_row_to_equipment(r) for r in rows]
 
 
-def get_equipment_stats(conn: sqlite3.Connection) -> dict:
+def get_equipment_stats(conn: sqlite3.Connection, archived: str = "all") -> dict:
     """Get summary statistics about equipment."""
+    where_sql, params = _archive_where_clause(archived)
+    where_clause = f"WHERE {where_sql}" if where_sql else ""
     row = conn.execute(
-        """
+        f"""
         SELECT
             COUNT(*) AS total,
             SUM(CASE WHEN lifecycle_status='active' THEN 1 ELSE 0 END) AS active,
@@ -448,9 +499,12 @@ def get_equipment_stats(conn: sqlite3.Connection) -> dict:
             SUM(CASE WHEN lifecycle_status='missing' THEN 1 ELSE 0 END) AS missing,
             SUM(CASE WHEN calibration_status='calibrated' THEN 1 ELSE 0 END) AS calibrated,
             SUM(CASE WHEN calibration_status='reference_only' THEN 1 ELSE 0 END) AS reference_only,
-            SUM(CASE WHEN verified_in_survey=1 THEN 1 ELSE 0 END) AS verified_in_survey
+            SUM(CASE WHEN verified_in_survey=1 THEN 1 ELSE 0 END) AS verified_in_survey,
+            SUM(CASE WHEN COALESCE(is_archived, 0)=1 THEN 1 ELSE 0 END) AS archived
         FROM equipment
-        """
+        {where_clause}
+        """,
+        params,
     ).fetchone()
     import_issues = conn.execute(
         "SELECT COUNT(*) FROM import_issues WHERE resolution_status='unresolved'"
@@ -464,6 +518,7 @@ def get_equipment_stats(conn: sqlite3.Connection) -> dict:
         "calibrated": row["calibrated"] or 0,
         "reference_only": row["reference_only"] or 0,
         "verified_in_survey": row["verified_in_survey"] or 0,
+        "archived": row["archived"] or 0,
         "import_issues": import_issues,
     }
 
@@ -562,6 +617,7 @@ def clear_all_data(conn: sqlite3.Connection, commit: bool = True) -> None:
 def _row_to_equipment(row: sqlite3.Row) -> Equipment:
     return Equipment(
         record_id=row["record_id"],
+        record_uuid=row["record_uuid"] if "record_uuid" in row.keys() else "",
         asset_number=row["asset_number"] or "",
         serial_number=row["serial_number"] or "",
         manufacturer=row["manufacturer"] or "",
@@ -592,6 +648,7 @@ def _row_to_equipment(row: sqlite3.Row) -> Equipment:
         links=row["links"] or "",
         notes=row["notes"] or "",
         manual_entry=bool(row["manual_entry"]),
+        is_archived=bool(row["is_archived"]) if "is_archived" in row.keys() else False,
         source_refs=row["source_refs"] or "[]",
         created_at=row["created_at"] or "",
         updated_at=row["updated_at"] or "",
@@ -631,6 +688,7 @@ def _search_equipment_with_like(
     conn: sqlite3.Connection,
     query: str,
     filters: dict[str, str],
+    archived: str,
 ) -> list[sqlite3.Row]:
     """Run the legacy LIKE-based search path."""
     search_fields = """(
@@ -651,6 +709,7 @@ def _search_equipment_with_like(
             conditions.append(search_fields)
             params.extend([f"%{word}%"] * field_count)
 
+    _append_archive_filter(conditions, params, archived)
     _append_exact_filters(conditions, params, filters)
 
     where = " AND ".join(conditions) if conditions else "1=1"
@@ -662,10 +721,12 @@ def _search_equipment_with_fts(
     conn: sqlite3.Connection,
     query: str,
     filters: dict[str, str],
+    archived: str,
 ) -> list[sqlite3.Row]:
     """Run the FTS-backed search path, preserving the existing filters."""
     conditions = ["s.search_text MATCH ?"]
     params: list = [query]
+    _append_archive_filter(conditions, params, archived, equipment_alias="e")
     _append_exact_filters(conditions, params, filters, equipment_alias="e")
 
     where = " AND ".join(conditions)
@@ -725,6 +786,35 @@ def _append_exact_filters(
         params.append(f"%{filters['location']}%")
 
 
+def _append_archive_filter(
+    conditions: list[str],
+    params: list,
+    archived: str,
+    equipment_alias: str = "",
+) -> None:
+    """Append the shared archive-state filter to a query when needed."""
+    where_sql, where_params = _archive_where_clause(archived, equipment_alias=equipment_alias)
+    if not where_sql:
+        return
+    conditions.append(where_sql)
+    params.extend(where_params)
+
+
+def _archive_where_clause(archived: str, equipment_alias: str = "") -> tuple[str, list[int]]:
+    """Return the SQL fragment and params for the requested archive scope."""
+    prefix = f"{equipment_alias}." if equipment_alias else ""
+    normalized = (archived or "all").strip().lower()
+
+    if normalized == "all":
+        return "", []
+    if normalized == "active":
+        return f"COALESCE({prefix}is_archived, 0)=0", []
+    if normalized == "archived":
+        return f"COALESCE({prefix}is_archived, 0)=1", []
+
+    raise ValueError(f"Unsupported archive scope: {archived}")
+
+
 def _upsert_equipment_search_row(conn: sqlite3.Connection, record_id: int | None, eq: Equipment) -> None:
     """Insert or replace a row in the FTS index."""
     if record_id is None:
@@ -770,6 +860,35 @@ def _ensure_equipment_column(conn: sqlite3.Connection, column_name: str, definit
     if column_name in columns:
         return
     conn.execute(f"ALTER TABLE equipment ADD COLUMN {column_name} {definition}")
+
+
+def _ensure_equipment_record_uuids(conn: sqlite3.Connection) -> None:
+    """Backfill stable UUIDs for equipment rows that do not have one yet."""
+    rows = conn.execute(
+        """
+        SELECT record_id
+        FROM equipment
+        WHERE TRIM(COALESCE(record_uuid, '')) = ''
+        """
+    ).fetchall()
+    for row in rows:
+        record_id = row["record_id"] if isinstance(row, sqlite3.Row) else row[0]
+        conn.execute(
+            "UPDATE equipment SET record_uuid=? WHERE record_id=?",
+            (_new_record_uuid(), record_id),
+        )
+
+
+def _ensure_record_uuid(eq: Equipment) -> str:
+    """Return a stable record UUID for an equipment instance."""
+    if not eq.record_uuid.strip():
+        eq.record_uuid = _new_record_uuid()
+    return eq.record_uuid
+
+
+def _new_record_uuid() -> str:
+    """Return a new stable record UUID string."""
+    return uuid.uuid4().hex
 
 
 def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:

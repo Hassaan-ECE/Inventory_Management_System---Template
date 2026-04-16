@@ -33,6 +33,13 @@ class AppConfig:
     html_report_filename: str
     html_report_title: str
     database_label: str
+    app_version: str
+    shared_network_root: str
+    shared_db_filename: str
+    release_manifest_filename: str
+    auto_sync_interval_ms: int
+    enable_shared_sync: bool
+    enable_update_checks: bool
 
 
 APP_CONFIG = AppConfig(
@@ -60,4 +67,11 @@ APP_CONFIG = AppConfig(
     html_report_filename="me_lab_inventory_report.html",
     html_report_title="ME Lab Inventory Review",
     database_label="ME Lab inventory database",
+    app_version="1.0.0",
+    shared_network_root=r"S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME",
+    shared_db_filename="me_lab_shared.db",
+    release_manifest_filename="current.json",
+    auto_sync_interval_ms=300000,
+    enable_shared_sync=True,
+    enable_update_checks=True,
 )
