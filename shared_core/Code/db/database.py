@@ -914,11 +914,8 @@ def _attached_table_exists(conn: sqlite3.Connection, database_name: str, table_n
 
 def _attached_table_columns(conn: sqlite3.Connection, database_name: str, table_name: str) -> set[str]:
     """Return the column names for a table inside an attached database."""
-    rows = conn.execute(
-        f"SELECT name FROM {database_name}.pragma_table_info(?)",
-        (table_name,),
-    ).fetchall()
-    return {row[0] for row in rows}
+    rows = conn.execute(f"PRAGMA {database_name}.table_info({table_name})").fetchall()
+    return {row["name"] if hasattr(row, "keys") else row[1] for row in rows}
 
 
 def _validate_import_source_schema(conn: sqlite3.Connection) -> None:

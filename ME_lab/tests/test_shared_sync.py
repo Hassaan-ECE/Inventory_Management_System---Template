@@ -4,11 +4,13 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app_config import APP_CONFIG
 from Code.db.database import create_tables, get_all_equipment, get_connection, insert_equipment, update_equipment
 from Code.db.models import Equipment
-from Code.sync.service import check_for_update, sync_local_with_shared
+from Code.sync.service import check_for_update, sync_interval_ms, sync_local_with_shared
 
 
 class SharedSyncTests(unittest.TestCase):
@@ -58,6 +60,19 @@ class SharedSyncTests(unittest.TestCase):
         self.assertEqual(info.version, "1.0.1")
         self.assertEqual(info.installer_path, installer_path)
         self.assertEqual(info.notes, "Shared sync improvements")
+
+    def test_sync_interval_ms_allows_shorter_configured_polling(self) -> None:
+        with patch(
+            "Code.sync.service.APP_CONFIG",
+            SimpleNamespace(auto_sync_interval_ms=10000),
+        ):
+            self.assertEqual(sync_interval_ms(), 10000)
+
+        with patch(
+            "Code.sync.service.APP_CONFIG",
+            SimpleNamespace(auto_sync_interval_ms=1000),
+        ):
+            self.assertEqual(sync_interval_ms(), 5000)
 
     def test_sync_initializes_local_database_from_shared_snapshot(self) -> None:
         shared_conn = self._open_shared_conn()
@@ -173,3 +188,90 @@ class SharedSyncTests(unittest.TestCase):
         self.assertEqual(second_result.pulled, 1)
         self.assertEqual(second_result.pushed, 0)
         self.assertEqual(local_eq.description, "Updated from another computer")
+
+    def test_sync_reconciles_same_record_with_different_uuids_without_duplication(self) -> None:
+        shared_conn = self._open_shared_conn()
+        try:
+            shared_id = insert_equipment(
+                shared_conn,
+                Equipment(
+                    asset_number="ME-500",
+                    manufacturer="Fluke",
+                    manufacturer_raw="Fluke",
+                    description="Shared source of truth",
+                ),
+            )
+            shared_conn.execute(
+                "UPDATE equipment SET updated_at='2026-04-17 09:00:00' WHERE record_id=?",
+                (shared_id,),
+            )
+            shared_conn.commit()
+            shared_eq = get_all_equipment(shared_conn, archived="all")[0]
+        finally:
+            shared_conn.close()
+
+        local_id = insert_equipment(
+            self.local_conn,
+            Equipment(
+                asset_number="ME-500",
+                manufacturer="Fluke",
+                manufacturer_raw="Fluke",
+                description="Local updated note",
+            ),
+        )
+        self.local_conn.execute(
+            "UPDATE equipment SET updated_at='2026-04-17 10:00:00' WHERE record_id=?",
+            (local_id,),
+        )
+        self.local_conn.commit()
+
+        result = sync_local_with_shared(self.local_conn, override_root=self.root)
+
+        local_rows = get_all_equipment(self.local_conn, archived="all")
+        shared_conn = self._open_shared_conn()
+        try:
+            shared_rows = get_all_equipment(shared_conn, archived="all")
+        finally:
+            shared_conn.close()
+
+        self.assertEqual(result.pushed, 1)
+        self.assertEqual(result.pulled, 0)
+        self.assertEqual(len(local_rows), 1)
+        self.assertEqual(len(shared_rows), 1)
+        self.assertEqual(local_rows[0].record_uuid, shared_eq.record_uuid)
+        self.assertEqual(shared_rows[0].record_uuid, shared_eq.record_uuid)
+        self.assertEqual(shared_rows[0].description, "Local updated note")
+
+    def test_sync_removes_exact_duplicate_rows_before_merge(self) -> None:
+        shared_conn = self._open_shared_conn()
+        try:
+            eq = Equipment(
+                asset_number="ME-600",
+                manufacturer="Mitutoyo",
+                manufacturer_raw="Mitutoyo",
+                description="Exact duplicate",
+            )
+            insert_equipment(shared_conn, eq)
+            insert_equipment(
+                shared_conn,
+                Equipment(
+                    asset_number=eq.asset_number,
+                    manufacturer=eq.manufacturer,
+                    manufacturer_raw=eq.manufacturer_raw,
+                    description=eq.description,
+                ),
+            )
+        finally:
+            shared_conn.close()
+
+        result = sync_local_with_shared(self.local_conn, override_root=self.root)
+
+        shared_conn = self._open_shared_conn()
+        try:
+            shared_rows = get_all_equipment(shared_conn, archived="all")
+        finally:
+            shared_conn.close()
+
+        self.assertEqual(len(shared_rows), 1)
+        self.assertEqual(result.pulled, 1)
+        self.assertEqual(result.conflicts, 0)

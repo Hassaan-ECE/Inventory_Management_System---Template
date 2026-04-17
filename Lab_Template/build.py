@@ -23,7 +23,7 @@ VENV_DIR = REPO_ROOT / ".venv312"
 OUTPUT_DIR = REPO_ROOT / "Output"
 EXE_NAME = APP_CONFIG.build_exe_name
 PYTHON_VERSION = "3.12"
-DEFAULT_VERSION = "1.0.0"
+DEFAULT_VERSION = APP_CONFIG.app_version
 
 
 def find_python() -> Path | None:
@@ -181,7 +181,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=f"Build {APP_CONFIG.display_name} .exe with Nuitka")
     parser.add_argument("--recreate-venv", action="store_true", help="Wipe and recreate the build venv")
     parser.add_argument("--sign", action="store_true", help="Code-sign the output exe")
-    parser.add_argument("--version", default=DEFAULT_VERSION, help="Version string (default: 1.0.0)")
+    parser.add_argument("--version", default=DEFAULT_VERSION, help=f"Version string (default: {DEFAULT_VERSION})")
     args = parser.parse_args()
 
     if args.recreate_venv and VENV_DIR.exists():

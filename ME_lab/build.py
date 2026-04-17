@@ -2,7 +2,7 @@
 
 Usage:
     python build.py
-    python build.py --version 0.9.0
+    python build.py --version 0.9.3
     python build.py --installer
     python build.py --installer --publish-shared
 """
@@ -248,7 +248,7 @@ def resolve_release_root(override_root: str) -> Path:
     raw_root = override_root.strip() or APP_CONFIG.shared_network_root.strip()
     if not raw_root:
         sys.exit("No shared release root is configured. Set app_config.py or pass --release-root.")
-    return Path(raw_root)
+    return Path(os.path.expandvars(raw_root)).expanduser()
 
 
 def ensure_release_structure(root: Path) -> None:
@@ -352,16 +352,21 @@ def main() -> None:
         default=DEFAULT_VERSION,
         help=f"Version string (default: {DEFAULT_VERSION})",
     )
+    parser.add_argument(
+        "--allow-version-mismatch",
+        action="store_true",
+        help="Allow a build version that differs from app_config.py (not recommended for normal releases).",
+    )
     args = parser.parse_args()
 
     if args.recreate_venv and VENV_DIR.exists():
         print(f"Removing existing venv at {VENV_DIR} ...")
         shutil.rmtree(VENV_DIR)
 
-    if args.version != APP_CONFIG.app_version:
-        print(
-            f"Warning: build version {args.version} does not match "
-            f"app_config.py version {APP_CONFIG.app_version}."
+    if args.version != APP_CONFIG.app_version and not args.allow_version_mismatch:
+        sys.exit(
+            f"Build version {args.version} does not match app_config.py version {APP_CONFIG.app_version}. "
+            "Use the matching version or pass --allow-version-mismatch if you intentionally need a different tag."
         )
 
     python_exe = find_python()

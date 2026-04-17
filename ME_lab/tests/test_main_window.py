@@ -5,13 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, QEvent
 from PySide6.QtWidgets import QApplication, QHeaderView, QMessageBox
 
 from Code.db.database import create_tables, get_connection, insert_equipment
 from Code.db.models import Equipment
 from Code.gui.main_window import MainWindow, active_filter_specs
 from Code.gui.equipment_table import DATA_COL_START, LINK_ROLE
+from Code.sync.service import UpdateInfo
 
 
 class MainWindowSmokeTests(unittest.TestCase):
@@ -142,6 +143,87 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.view_tabs.setCurrentIndex(1)
             self.app.processEvents()
             self.assertEqual(window.table.rowCount(), 1)
+        finally:
+            window.close()
+
+    def test_close_flushes_pending_shared_sync(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            window._pending_sync_timer.start()
+            with patch.object(window, "_run_shared_sync") as run_sync:
+                window.close()
+                self.app.processEvents()
+
+            run_sync.assert_called_once_with(quiet=True)
+        finally:
+            window.close()
+
+    def test_activation_change_schedules_foreground_sync(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            window._foreground_sync_timer.setInterval(0)
+            with patch.object(window, "isActiveWindow", return_value=True), patch.object(
+                window, "_run_shared_sync"
+            ) as run_sync:
+                window.changeEvent(QEvent(QEvent.ActivationChange))
+                self.app.processEvents()
+
+            run_sync.assert_called_once_with(quiet=True)
+        finally:
+            window.close()
+
+    def test_shared_db_change_schedules_near_immediate_sync(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            window._shared_change_sync_timer.setInterval(0)
+            with patch.object(window, "_refresh_shared_watch_paths"), patch.object(
+                window, "_run_shared_sync"
+            ) as run_sync:
+                window._on_shared_path_changed("S:/shared/me_lab_shared.db")
+                self.app.processEvents()
+
+            run_sync.assert_called_once_with(quiet=True)
+        finally:
+            window.close()
+
+    def test_accepting_available_update_launches_installer_and_closes_app(self) -> None:
+        window = MainWindow(self.conn)
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            installer_path = Path(self.temp_dir.name) / "ME_Lab_Inventory_Setup.exe"
+            update_info = UpdateInfo(
+                version="0.9.1",
+                installer_path=installer_path,
+                published_at="2026-04-17T10:04:22",
+                notes="Internal bug-fix prerelease",
+            )
+
+            with patch("Code.gui.main_window.check_for_update", return_value=update_info), patch(
+                "Code.gui.main_window.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(window, "_launch_update_installer", return_value=True) as launch_installer, patch.object(
+                window, "_quit_for_update"
+            ) as quit_for_update:
+                window._prompt_for_available_update()
+
+            launch_installer.assert_called_once_with(installer_path)
+            self.assertEqual(window.statusBar().currentMessage(), "Opened installer for version 0.9.1. Closing app for update.")
+            quit_for_update.assert_called_once_with()
         finally:
             window.close()
 

@@ -18,6 +18,10 @@ SHARED_DB_FILENAME = getattr(APP_CONFIG, "shared_db_filename", "").strip()
 RELEASE_MANIFEST_FILENAME = getattr(APP_CONFIG, "release_manifest_filename", "current.json").strip() or "current.json"
 
 
+def _normalize_path(raw: str) -> Path:
+    return Path(os.path.expandvars(raw)).expanduser()
+
+
 def bundle_root() -> Path:
     """Return the active app root directory for the current variant."""
     config_file = getattr(app_config_module, "__file__", "")
@@ -47,7 +51,7 @@ def external_data_dir() -> Path:
 def resolve_data_dir() -> Path:
     """Prefer a user-provided Data directory next to the executable."""
     external = external_data_dir()
-    if external.exists():
+    if external.exists() and external.is_dir():
         return external
     return bundled_data_dir()
 
@@ -62,7 +66,7 @@ def resolve_db_path() -> Path:
     """
     override = os.environ.get(DB_PATH_ENV_VAR, "").strip()
     if override:
-        return Path(override).expanduser()
+        return _normalize_path(override)
 
     if is_compiled():
         return user_state_dir(create=True) / DB_FILENAME
@@ -91,7 +95,7 @@ def shared_root_dir() -> Path | None:
     """Return the configured shared network root for this app variant, if any."""
     if not SHARED_NETWORK_ROOT:
         return None
-    return Path(SHARED_NETWORK_ROOT)
+    return _normalize_path(SHARED_NETWORK_ROOT)
 
 
 def shared_database_dir(create: bool = False) -> Path | None:

@@ -1,11 +1,12 @@
 """Single-page search-driven equipment lookup."""
 
+import subprocess
 import sqlite3
 import tempfile
 import urllib.parse
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -66,7 +67,14 @@ from Code.sync.service import (
     update_checks_enabled,
 )
 from Code.utils.equipment_fields import parse_age_years
-from Code.utils.runtime_paths import bundle_root, executable_dir, is_compiled, resolve_data_dir
+from Code.utils.runtime_paths import (
+    bundle_root,
+    executable_dir,
+    is_compiled,
+    resolve_data_dir,
+    shared_database_dir,
+    shared_db_path,
+)
 
 _SEARCH_URL_TEMPLATE = "https://www.google.com/search?q={query}"
 QUICK_EDIT_OPTIONS = {
@@ -112,16 +120,28 @@ class MainWindow(QMainWindow):
         self._hovered_link_cell: tuple[int, int] | None = None
         self._pending_sync_timer = QTimer(self)
         self._pending_sync_timer.setSingleShot(True)
-        self._pending_sync_timer.setInterval(8000)
+        self._pending_sync_timer.setInterval(0)
         self._pending_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
+        self._foreground_sync_timer = QTimer(self)
+        self._foreground_sync_timer.setSingleShot(True)
+        self._foreground_sync_timer.setInterval(1000)
+        self._foreground_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
+        self._shared_change_sync_timer = QTimer(self)
+        self._shared_change_sync_timer.setSingleShot(True)
+        self._shared_change_sync_timer.setInterval(0)
+        self._shared_change_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
         self._periodic_sync_timer = QTimer(self)
         self._periodic_sync_timer.setInterval(sync_interval_ms())
         self._periodic_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
+        self._shared_watcher = QFileSystemWatcher(self)
+        self._shared_watcher.fileChanged.connect(self._on_shared_path_changed)
+        self._shared_watcher.directoryChanged.connect(self._on_shared_path_changed)
         self._update_prompted_version = ""
 
         self._setup_ui()
         self._do_search()
         if shared_sync_enabled():
+            self._refresh_shared_watch_paths()
             self._periodic_sync_timer.start()
         if shared_sync_enabled() or (update_checks_enabled() and is_compiled()):
             QTimer.singleShot(1200, self._run_startup_maintenance)
@@ -353,6 +373,22 @@ class MainWindow(QMainWindow):
                 self._clear_link_hover_hint()
         return super().eventFilter(watched, event)
 
+    def changeEvent(self, event) -> None:
+        """Pull shared changes again when the window becomes active."""
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._schedule_foreground_sync()
+        super().changeEvent(event)
+
+    def closeEvent(self, event) -> None:
+        """Flush a pending local sync before the window closes."""
+        if shared_sync_enabled():
+            self._foreground_sync_timer.stop()
+            self._shared_change_sync_timer.stop()
+            if self._pending_sync_timer.isActive():
+                self._pending_sync_timer.stop()
+                self._run_shared_sync(quiet=True)
+        super().closeEvent(event)
+
     def _schedule_search(self) -> None:
         """Debounce search/filter changes."""
         self._timer.start()
@@ -436,7 +472,7 @@ class MainWindow(QMainWindow):
             self,
             "Update Available",
             f"Version {update_info.version} is available for {APP_CONFIG.display_name}.{published_suffix}\n\n"
-            "Open the installer now? The app may need to close before the update can finish."
+            "Open the installer now? The app will close so the update can finish cleanly."
             f"{notes_suffix}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
@@ -444,8 +480,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        installer_url = QUrl.fromLocalFile(str(update_info.installer_path))
-        if not QDesktopServices.openUrl(installer_url):
+        if not self._launch_update_installer(update_info.installer_path):
             QMessageBox.warning(
                 self,
                 "Update Available",
@@ -453,13 +488,77 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self.status_bar.showMessage(f"Opened installer for version {update_info.version}.", 5000)
+        self.status_bar.showMessage(f"Opened installer for version {update_info.version}. Closing app for update.", 5000)
+        self._quit_for_update()
+
+    def _launch_update_installer(self, installer_path: Path) -> bool:
+        """Start the published installer as a real child process."""
+        try:
+            subprocess.Popen(
+                [str(installer_path)],
+                cwd=str(installer_path.parent),
+            )
+        except OSError:
+            return False
+        return True
+
+    def _quit_for_update(self) -> None:
+        """Exit the running app after handing off to the installer."""
+        self.hide()
+        app = QApplication.instance()
+        if app is None:
+            return
+        QTimer.singleShot(0, app.quit)
 
     def _schedule_shared_sync(self) -> None:
         """Queue a background sync after local changes settle."""
         if not shared_sync_enabled():
             return
         self._pending_sync_timer.start()
+
+    def _schedule_foreground_sync(self) -> None:
+        """Pull shared changes shortly after the window becomes active again."""
+        if not shared_sync_enabled():
+            return
+        if self._pending_sync_timer.isActive():
+            return
+        self._foreground_sync_timer.start()
+
+    def _refresh_shared_watch_paths(self) -> None:
+        """Keep a live watch on the shared DB file and directory when available."""
+        if not shared_sync_enabled():
+            return
+
+        desired_paths: list[str] = []
+        shared_dir = shared_database_dir(create=False)
+        if shared_dir is not None and shared_dir.exists():
+            desired_paths.append(str(shared_dir))
+
+        shared_path = shared_db_path()
+        if shared_path is not None and shared_path.exists():
+            desired_paths.append(str(shared_path))
+
+        current_paths = set(self._shared_watcher.files()) | set(self._shared_watcher.directories())
+        desired_set = set(desired_paths)
+
+        for path in current_paths - desired_set:
+            self._shared_watcher.removePath(path)
+
+        for path in desired_set - current_paths:
+            self._shared_watcher.addPath(path)
+
+    def _on_shared_path_changed(self, _path: str) -> None:
+        """React to shared DB file changes with a near-immediate pull."""
+        self._refresh_shared_watch_paths()
+        self._schedule_remote_sync()
+
+    def _schedule_remote_sync(self) -> None:
+        """Queue a very short debounce for a shared DB change notification."""
+        if not shared_sync_enabled():
+            return
+        if self._pending_sync_timer.isActive():
+            return
+        self._shared_change_sync_timer.start()
 
     def _run_shared_sync(self, quiet: bool = False) -> None:
         """Synchronize the local database with the shared workspace."""
@@ -481,6 +580,8 @@ class MainWindow(QMainWindow):
         elif result.pushed:
             self._refresh_view_tabs()
             self._update_status_bar()
+
+        self._refresh_shared_watch_paths()
 
         if result.conflicts:
             self.status_bar.showMessage(result.message or "Shared sync found conflicts to review.", 7000)

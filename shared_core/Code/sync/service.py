@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import shutil
 import socket
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from Code.db.database import (
     import_database_snapshot,
 )
 from Code.db.models import Equipment
+from Code.importer.matching import build_equipment_indexes, resolve_equipment_match
 from Code.utils.runtime_paths import (
     shared_backup_dir,
     shared_database_dir,
@@ -130,6 +132,12 @@ def sync_local_with_shared(local_conn, override_root: Path | None = None) -> Syn
             shared_conn = get_connection(shared_path, use_wal=False)
             try:
                 create_tables(shared_conn)
+                backed_up_shared = False
+
+                shared_changed = _dedupe_exact_equipment_rows(shared_conn)
+                if shared_changed and not backed_up_shared:
+                    _backup_shared_db(shared_path, backups_dir)
+                    backed_up_shared = True
 
                 local_count = _equipment_count(local_conn)
                 shared_count = _equipment_count(shared_conn)
@@ -158,6 +166,9 @@ def sync_local_with_shared(local_conn, override_root: Path | None = None) -> Syn
                         message=f"Published {local_count} local records to the shared database.",
                     )
 
+                _dedupe_exact_equipment_rows(local_conn)
+                _align_local_records_to_shared(local_conn, shared_conn)
+
                 state_by_uuid = _load_record_sync_state(local_conn)
                 local_rows = {eq.record_uuid: eq for eq in get_all_equipment(local_conn, archived="all") if eq.record_uuid}
                 shared_rows = {eq.record_uuid: eq for eq in get_all_equipment(shared_conn, archived="all") if eq.record_uuid}
@@ -165,7 +176,7 @@ def sync_local_with_shared(local_conn, override_root: Path | None = None) -> Syn
                 pushed = 0
                 pulled = 0
                 conflicts = 0
-                backed_up_shared = False
+                backed_up_shared = backed_up_shared or shared_changed
 
                 for record_uuid in sorted(set(local_rows) | set(shared_rows)):
                     local_eq = local_rows.get(record_uuid)
@@ -258,7 +269,7 @@ def sync_local_with_shared(local_conn, override_root: Path | None = None) -> Syn
                 shared_conn.close()
     except TimeoutError:
         return SyncResult(enabled=True, shared_available=True, message="Another computer is syncing right now.")
-    except OSError:
+    except (OSError, sqlite3.DatabaseError):
         return SyncResult(enabled=True, message="Shared workspace is unavailable right now.")
 
 
@@ -300,8 +311,12 @@ def check_for_update(override_root: Path | None = None) -> UpdateInfo | None:
 
 def sync_interval_ms() -> int:
     """Return the configured automatic sync interval for this app."""
-    value = int(getattr(APP_CONFIG, "auto_sync_interval_ms", 300000) or 300000)
-    return max(30000, value)
+    value = getattr(APP_CONFIG, "auto_sync_interval_ms", 300000)
+    try:
+        interval_ms = int(value or 300000)
+    except (TypeError, ValueError):
+        interval_ms = 300000
+    return max(5000, interval_ms)
 
 
 def _resolve_shared_root(override_root: Path | None = None) -> Path | None:
@@ -363,6 +378,149 @@ def _rebuild_local_sync_state(conn) -> None:
         _set_record_sync_state(conn, eq.record_uuid, _equipment_sync_hash(eq))
     conn.execute("UPDATE sync_conflicts SET resolved=1 WHERE resolved=0")
     conn.commit()
+
+
+def _dedupe_exact_equipment_rows(conn) -> bool:
+    """Collapse rows that are identical except for UUID/timestamps."""
+    rows = [eq for eq in get_all_equipment(conn, archived="all") if eq.record_uuid]
+    groups: dict[str, list[Equipment]] = {}
+    for eq in rows:
+        groups.setdefault(_equipment_sync_hash(eq), []).append(eq)
+
+    changed = False
+    for sync_hash, grouped_rows in groups.items():
+        if len(grouped_rows) <= 1:
+            continue
+
+        canonical = min(grouped_rows, key=_canonical_equipment_identity)
+        duplicates = [eq for eq in grouped_rows if eq.record_uuid != canonical.record_uuid]
+        if not duplicates:
+            continue
+
+        changed = True
+        for duplicate in duplicates:
+            _clear_record_sync_state(conn, duplicate.record_uuid)
+            _resolve_conflict(conn, duplicate.record_uuid)
+            _delete_equipment_by_uuid(conn, duplicate.record_uuid)
+
+        _clear_record_sync_state(conn, canonical.record_uuid)
+        _set_record_sync_state(conn, canonical.record_uuid, sync_hash)
+        _resolve_conflict(conn, canonical.record_uuid)
+
+    if changed:
+        conn.commit()
+    return changed
+
+
+def _align_local_records_to_shared(local_conn, shared_conn) -> None:
+    """Match pre-sync local rows to shared rows before UUID-based merge logic."""
+    local_rows = [eq for eq in get_all_equipment(local_conn, archived="all") if eq.record_uuid]
+    shared_rows = [eq for eq in get_all_equipment(shared_conn, archived="all") if eq.record_uuid]
+    if not local_rows or not shared_rows:
+        return
+
+    shared_by_uuid = {eq.record_uuid: eq for eq in shared_rows if eq.record_uuid}
+    shared_by_hash: dict[str, list[Equipment]] = {}
+    for eq in shared_rows:
+        shared_by_hash.setdefault(_equipment_sync_hash(eq), []).append(eq)
+
+    by_asset, by_serial, by_import_key = build_equipment_indexes(shared_rows)
+    local_uuids = {eq.record_uuid for eq in local_rows if eq.record_uuid}
+    changed = False
+
+    for eq in local_rows:
+        if not eq.record_uuid or eq.record_uuid in shared_by_uuid:
+            continue
+
+        shared_match = _resolve_shared_match(eq, shared_by_hash, by_asset, by_serial, by_import_key)
+        if shared_match is None or not shared_match.record_uuid:
+            continue
+        if shared_match.record_uuid in local_uuids:
+            continue
+
+        changed = True
+        old_uuid = eq.record_uuid
+        local_hash = _equipment_sync_hash(eq)
+        shared_hash = _equipment_sync_hash(shared_match)
+
+        local_conn.execute(
+            "UPDATE equipment SET record_uuid=? WHERE record_uuid=?",
+            (shared_match.record_uuid, old_uuid),
+        )
+        _clear_record_sync_state(local_conn, old_uuid)
+        local_conn.execute("DELETE FROM sync_conflicts WHERE record_uuid=?", (old_uuid,))
+
+        if local_hash == shared_hash:
+            _set_record_sync_state(local_conn, shared_match.record_uuid, local_hash)
+            _resolve_conflict(local_conn, shared_match.record_uuid)
+        else:
+            baseline_hash = _baseline_hash_for_aligned_match(eq, shared_match, local_hash, shared_hash)
+            if baseline_hash:
+                _set_record_sync_state(local_conn, shared_match.record_uuid, baseline_hash)
+            else:
+                _clear_record_sync_state(local_conn, shared_match.record_uuid)
+
+        local_uuids.discard(old_uuid)
+        local_uuids.add(shared_match.record_uuid)
+
+    if changed:
+        local_conn.commit()
+
+
+def _resolve_shared_match(
+    eq: Equipment,
+    shared_by_hash: dict[str, list[Equipment]],
+    by_asset: dict[str, list[Equipment]],
+    by_serial: dict[str, list[Equipment]],
+    by_import_key: dict[str, list[Equipment]],
+) -> Equipment | None:
+    """Find the single shared row that should represent this local record."""
+    exact_matches = shared_by_hash.get(_equipment_sync_hash(eq), [])
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    if len(exact_matches) > 1:
+        return None
+
+    match = resolve_equipment_match(
+        by_asset,
+        by_serial,
+        by_import_key,
+        asset_number=eq.asset_number,
+        serial_number=eq.serial_number,
+        import_key=eq.primary_import_key(),
+    )
+    if match.status != "matched":
+        return None
+    return match.record
+
+
+def _baseline_hash_for_aligned_match(
+    local_eq: Equipment,
+    shared_eq: Equipment,
+    local_hash: str,
+    shared_hash: str,
+) -> str:
+    """Infer which side represents the last common baseline for an aligned pair."""
+    local_updated = _normalized_updated_at(local_eq)
+    shared_updated = _normalized_updated_at(shared_eq)
+    if local_updated > shared_updated:
+        return shared_hash
+    if shared_updated > local_updated:
+        return local_hash
+    return ""
+
+
+def _normalized_updated_at(eq: Equipment) -> str:
+    """Return a sortable timestamp fallback for sync comparison."""
+    return (eq.updated_at or eq.created_at or "").strip()
+
+
+def _canonical_equipment_identity(eq: Equipment) -> tuple[str, str, int]:
+    """Return a deterministic sort key used when collapsing exact duplicates."""
+    record_uuid = (eq.record_uuid or "").strip()
+    created_at = (eq.created_at or "").strip()
+    record_id = int(eq.record_id or 0)
+    return record_uuid, created_at, record_id
 
 
 def _load_record_sync_state(conn) -> dict[str, str]:

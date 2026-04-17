@@ -12,7 +12,7 @@ class AppConfig:
     app_dir_name: str
     display_name: str
     application_name: str
-    creator_name: str
+    creator_name: str = ""
     company_name: str
     product_name: str
     file_description: str
@@ -73,11 +73,11 @@ APP_CONFIG = AppConfig(
     html_report_filename="me_lab_inventory_report.html",
     html_report_title="ME Lab Inventory Review",
     database_label="ME Lab inventory database",
-    app_version="0.9.0",
+    app_version="0.9.3",
     shared_network_root=r"S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME",
     shared_db_filename="me_lab_shared.db",
     release_manifest_filename="current.json",
-    auto_sync_interval_ms=300000,
+    auto_sync_interval_ms=10000,
     enable_shared_sync=True,
     enable_update_checks=True,
 )

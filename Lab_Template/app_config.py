@@ -42,6 +42,7 @@ class AppConfig:
     auto_sync_interval_ms: int
     enable_shared_sync: bool
     enable_update_checks: bool
+    creator_name: str = ""
 
 
 APP_CONFIG = AppConfig(
@@ -98,4 +99,5 @@ APP_CONFIG = AppConfig(
     auto_sync_interval_ms=300000,
     enable_shared_sync=False,
     enable_update_checks=False,
+    creator_name="Your Team",
 )

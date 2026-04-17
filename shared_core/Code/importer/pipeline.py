@@ -421,19 +421,6 @@ def _source_row_from_refs(source_refs: str) -> int:
     return Equipment(source_refs=source_refs).first_source_row("All Equip")
 
 
-def _resolve_import_paths(data_dir: Path) -> tuple[Path, Path]:
-    """Return the expected import workbook paths and validate that they exist."""
-    master_path = data_dir / MASTER_FILE
-    survey_path = data_dir / SURVEY_FILE
-
-    if not master_path.exists():
-        raise FileNotFoundError(f"Master workbook not found: {master_path}")
-    if not survey_path.exists():
-        raise FileNotFoundError(f"Survey workbook not found: {survey_path}")
-
-    return master_path, survey_path
-
-
 def _merge_imported_records(
     combined_records: list[Equipment],
     imported_records: list[Equipment],

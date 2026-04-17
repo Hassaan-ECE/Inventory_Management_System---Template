@@ -1,4 +1,5 @@
 """Parser for the Master List Excel workbook (.xls)."""
+import json
 from pathlib import Path
 
 import xlrd
