@@ -2,6 +2,8 @@
 
 `ME_lab` is the Mechanical Engineering / machine shop variant of the shared desktop inventory system. This folder now contains a real app setup, not only planning notes.
 
+Built and maintained by `Syed Hassaan Shah`.
+
 ## Folder Structure
 
 ```text
@@ -33,6 +35,7 @@ The ME app reuses `shared_core` for the database, GUI, import pipeline, search, 
 Key ME settings today:
 
 - current internal prerelease version: `0.9.0`
+- builder / publisher: `Syed Hassaan Shah`
 - source workbook: `Data/Machine Shop Material list.xlsx`
 - database filename: `Data/me_lab_inventory.db` for source runs
 - DB override env var: `ME_LAB_INVENTORY_DB_PATH`
@@ -114,6 +117,7 @@ ME\
 Notes:
 
 - `current.json` tells installed clients which installer is the current release
+- `current.json` and `release.json` include `built_by` / `publisher` metadata for `Syed Hassaan Shah`
 - `shared\me_lab_shared.db` is created automatically once the shared-sync path is used
 - `backups\` stores shared DB snapshots before shared writes
 - `releases\<version>\` stores the published installer, raw exe, and release metadata
@@ -161,6 +165,12 @@ Useful build flags:
 - `--release-root <path>` publishes to a different shared root than the one in `app_config.py`
 - `--sign` signs the built exe and installer when the code-signing environment variables are configured
 
+Build branding notes:
+
+- rebuilt executables embed the shared app icon from `shared_core/assets/app_icon.ico`
+- rebuilt installers use the same shared icon for the installer shell
+- rebuilt executables and installers use `Syed Hassaan Shah` as the publisher / builder attribution
+
 ## Install And Remove
 
 Install the app from the published installer:
@@ -170,6 +180,8 @@ S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME\releases\0.9.0\ME_Lab_In
 ```
 
 The installer places the app in the user profile and registers a normal Windows uninstall entry.
+
+The built executable and installer metadata use `Syed Hassaan Shah` as the publisher / builder attribution.
 
 Uninstall behavior:
 

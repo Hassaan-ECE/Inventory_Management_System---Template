@@ -12,6 +12,7 @@ class AppConfig:
     app_dir_name: str
     display_name: str
     application_name: str
+    creator_name: str
     company_name: str
     product_name: str
     file_description: str
@@ -48,9 +49,10 @@ APP_CONFIG = AppConfig(
     app_dir_name="ME_Lab_Inventory",
     display_name="ME Lab Inventory",
     application_name="ME Lab Inventory Manager",
-    company_name="ME Lab Inventory",
+    creator_name="Syed Hassaan Shah",
+    company_name="Syed Hassaan Shah",
     product_name="ME Lab Inventory",
-    file_description="ME Lab Inventory Manager",
+    file_description="ME Lab Inventory Manager by Syed Hassaan Shah",
     db_filename="me_lab_inventory.db",
     db_path_env_var="ME_LAB_INVENTORY_DB_PATH",
     build_exe_name="ME_Lab_Inventory.exe",

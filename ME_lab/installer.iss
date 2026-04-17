@@ -16,6 +16,9 @@
 #ifndef SourceExe
   #error SourceExe define is required.
 #endif
+#ifndef IconFile
+  #error IconFile define is required.
+#endif
 #ifndef OutputDir
   #error OutputDir define is required.
 #endif
@@ -32,6 +35,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\Programs\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
+SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma
 SolidCompression=yes

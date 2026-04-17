@@ -24,6 +24,8 @@ from app_config import APP_CONFIG
 REPO_ROOT = Path(__file__).resolve().parent
 SHARED_ROOT = REPO_ROOT.parent / "shared_core"
 SHARED_ASSETS_DIR = SHARED_ROOT / "Code" / "gui" / "assets"
+SHARED_BRANDING_DIR = SHARED_ROOT / "assets"
+APP_ICON_PATH = SHARED_BRANDING_DIR / "app_icon.ico"
 VENV_DIR = REPO_ROOT / ".venv312"
 OUTPUT_DIR = REPO_ROOT / "Output"
 INSTALLER_SCRIPT = REPO_ROOT / "installer.iss"
@@ -174,8 +176,11 @@ def build(python_exe: Path, version: str, jobs: int) -> Path:
         f"--product-version={version}",
         f"--include-data-dir={REPO_ROOT / 'Data'}=Data",
         f"--include-data-dir={SHARED_ASSETS_DIR}=Code/gui/assets",
+        f"--include-data-dir={SHARED_BRANDING_DIR}=assets",
         str(REPO_ROOT / "main.py"),
     ]
+    if APP_ICON_PATH.exists():
+        nuitka_args.insert(-1, f"--windows-icon-from-ico={APP_ICON_PATH}")
 
     print("Running Nuitka build ...")
     result = subprocess.run(nuitka_args, check=False, env=build_env)
@@ -221,6 +226,7 @@ def build_installer(version: str, source_exe: Path) -> Path:
         f"/DAppPublisher={APP_CONFIG.company_name}",
         f"/DAppExeName={EXE_NAME}",
         f"/DAppId={installer_app_id}",
+        f"/DIconFile={APP_ICON_PATH}",
         f"/DSourceExe={source_exe}",
         f"/DOutputDir={OUTPUT_DIR}",
         f"/DOutputBaseFilename={output_base}",
@@ -278,13 +284,17 @@ def publish_release(
         shutil.copy2(installer_path, published_installer)
 
     notes_text = notes.strip()
+    release_lines = [f"Built by {APP_CONFIG.creator_name}"]
     if notes_text:
-        (release_dir / "release_notes.txt").write_text(notes_text + "\n", encoding="utf-8")
+        release_lines.append(notes_text)
+    (release_dir / "release_notes.txt").write_text("\n".join(release_lines) + "\n", encoding="utf-8")
 
     published_at = datetime.now().astimezone().isoformat(timespec="seconds")
     release_info = {
         "version": version,
         "published_at": published_at,
+        "built_by": APP_CONFIG.creator_name,
+        "publisher": APP_CONFIG.company_name,
         "exe_name": EXE_NAME,
         "exe_sha256": sha256_for(published_exe),
         "installer_name": INSTALLER_NAME if published_installer else "",
@@ -299,6 +309,8 @@ def publish_release(
 
     manifest = {
         "version": version,
+        "built_by": APP_CONFIG.creator_name,
+        "publisher": APP_CONFIG.company_name,
         "installer_path": published_installer.relative_to(release_root).as_posix(),
         "published_at": published_at,
         "notes": notes_text,
