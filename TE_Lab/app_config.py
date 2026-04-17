@@ -18,6 +18,8 @@ class AppConfig:
     db_filename: str
     db_path_env_var: str
     build_exe_name: str
+    installer_exe_name: str
+    installer_app_id: str
     master_source_file: str
     survey_source_file: str
     import_profile: str
@@ -52,6 +54,8 @@ APP_CONFIG = AppConfig(
     db_filename="lab_equipment.db",
     db_path_env_var="TE_LAB_EQUIPMENT_DB_PATH",
     build_exe_name="TE_Lab_Equipment.exe",
+    installer_exe_name="TE_Lab_Equipment_Setup.exe",
+    installer_app_id="{D7BCB071-0B47-47EC-960E-996FA64516A9}",
     master_source_file="Master List of Eng.Equipment - All - 2020.RO.xls",
     survey_source_file="Survey oF Equip In Eng Lab.xlsx",
     import_profile="te_dual_workbook",

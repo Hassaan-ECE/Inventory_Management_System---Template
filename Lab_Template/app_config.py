@@ -18,6 +18,8 @@ class AppConfig:
     db_filename: str
     db_path_env_var: str
     build_exe_name: str
+    installer_exe_name: str
+    installer_app_id: str
     master_source_file: str
     survey_source_file: str
     import_profile: str
@@ -52,6 +54,8 @@ APP_CONFIG = AppConfig(
     db_filename="lab_inventory.db",
     db_path_env_var="LAB_INVENTORY_DB_PATH",
     build_exe_name="Lab_Inventory.exe",
+    installer_exe_name="Lab_Inventory_Setup.exe",
+    installer_app_id="{42866E6C-0F7F-4F3B-B788-61C271D4A164}",
     master_source_file="Master_Source.xlsx",
     survey_source_file="Survey_Source.xlsx",
     import_profile="te_dual_workbook",

@@ -18,6 +18,8 @@ class AppConfig:
     db_filename: str
     db_path_env_var: str
     build_exe_name: str
+    installer_exe_name: str
+    installer_app_id: str
     master_source_file: str
     survey_source_file: str
     import_profile: str
@@ -52,6 +54,8 @@ APP_CONFIG = AppConfig(
     db_filename="me_lab_inventory.db",
     db_path_env_var="ME_LAB_INVENTORY_DB_PATH",
     build_exe_name="ME_Lab_Inventory.exe",
+    installer_exe_name="ME_Lab_Inventory_Setup.exe",
+    installer_app_id="{4C0E72D9-BC8D-4FCB-B18F-5C932359832B}",
     master_source_file="Machine Shop Material list.xlsx",
     survey_source_file="",
     import_profile="me_single_workbook",
@@ -67,7 +71,7 @@ APP_CONFIG = AppConfig(
     html_report_filename="me_lab_inventory_report.html",
     html_report_title="ME Lab Inventory Review",
     database_label="ME Lab inventory database",
-    app_version="1.0.0",
+    app_version="0.9.0",
     shared_network_root=r"S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME",
     shared_db_filename="me_lab_shared.db",
     release_manifest_filename="current.json",

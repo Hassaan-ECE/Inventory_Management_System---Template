@@ -21,7 +21,7 @@ ME_lab/
 
 - `main.py` launches the desktop app and triggers the first-run import when the database is empty.
 - `app_config.py` defines the ME-specific identity, file names, table fields, feature flags, and export names.
-- `build.py` packages the ME app into a Windows `.exe` with Nuitka.
+- `build.py` packages the ME app into a Windows `.exe` with Nuitka, can build an installer, and can publish a release into the ME shared-drive folder structure.
 - `Data/` holds the ME workbook and the local SQLite database used during source runs.
 - `tests/` contains ME-focused regression tests for import, window behavior, and the add/edit dialog.
 - `Machine_Shop_Inventory_System.txt` is the original requirement brief that guided the ME variant.
@@ -97,15 +97,23 @@ Current test coverage in this folder includes:
 
 ## Build
 
+Standard prerelease build:
+
 ```bash
 cd ME_lab
 python build.py
 ```
 
-Optional version example:
+Build the current internal prerelease installer:
 
 ```bash
-python build.py --version 1.0.0
+python build.py --version 0.9.0 --installer
+```
+
+Build and publish a shared release bundle:
+
+```bash
+python build.py --version 0.9.0 --installer --publish-shared --notes "Internal prerelease for ME shared-sync testing"
 ```
 
 ## Relationship To The Rest Of The Repo
