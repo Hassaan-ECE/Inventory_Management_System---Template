@@ -32,6 +32,7 @@ The ME app reuses `shared_core` for the database, GUI, import pipeline, search, 
 
 Key ME settings today:
 
+- current internal prerelease version: `0.9.0`
 - source workbook: `Data/Machine Shop Material list.xlsx`
 - database filename: `Data/me_lab_inventory.db` for source runs
 - DB override env var: `ME_LAB_INVENTORY_DB_PATH`
@@ -40,6 +41,13 @@ Key ME settings today:
 - record images: enabled in the edit dialog
 - project field: enabled in the edit dialog
 - calibration-focused TE UI sections: disabled for ME
+
+The ME app is now local-first:
+
+- each installed computer uses its own local SQLite database
+- the shared ME workspace holds the canonical shared database plus release artifacts
+- startup and background sync try to merge local and shared changes when it is safe to do so
+- app updates are driven by the shared `current.json` release manifest
 
 ## Import Notes
 
@@ -79,6 +87,37 @@ python main.py
 
 When the database is empty, startup imports from `Data/Machine Shop Material list.xlsx`. If you run a compiled build instead of source, the runtime prefers a `Data/` folder next to the executable when one exists.
 
+## Shared Release Layout
+
+The current shared ME release root is:
+
+```text
+S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME
+```
+
+Expected layout:
+
+```text
+ME\
+|-- current.json
+|-- backups\
+|-- releases\
+|   `-- 0.9.0\
+|       |-- ME_Lab_Inventory.exe
+|       |-- ME_Lab_Inventory_Setup.exe
+|       |-- release.json
+|       `-- release_notes.txt
+`-- shared\
+    `-- me_lab_shared.db
+```
+
+Notes:
+
+- `current.json` tells installed clients which installer is the current release
+- `shared\me_lab_shared.db` is created automatically once the shared-sync path is used
+- `backups\` stores shared DB snapshots before shared writes
+- `releases\<version>\` stores the published installer, raw exe, and release metadata
+
 ## Tests
 
 Run the ME test set with:
@@ -115,6 +154,28 @@ Build and publish a shared release bundle:
 ```bash
 python build.py --version 0.9.0 --installer --publish-shared --notes "Internal prerelease for ME shared-sync testing"
 ```
+
+Useful build flags:
+
+- `--jobs 1` keeps Nuitka on a single compile job and is safer on lower-memory laptops
+- `--release-root <path>` publishes to a different shared root than the one in `app_config.py`
+- `--sign` signs the built exe and installer when the code-signing environment variables are configured
+
+## Install And Remove
+
+Install the app from the published installer:
+
+```text
+S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME\releases\0.9.0\ME_Lab_Inventory_Setup.exe
+```
+
+The installer places the app in the user profile and registers a normal Windows uninstall entry.
+
+Uninstall behavior:
+
+- uninstall removes the installed program files
+- uninstall does not delete the local user database under `%LOCALAPPDATA%\ME_Lab_Inventory\` by default
+- preserving the local database is intentional so an uninstall does not silently remove inventory data
 
 ## Relationship To The Rest Of The Repo
 
