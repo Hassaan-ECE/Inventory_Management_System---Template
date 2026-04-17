@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass
+from typing import Any
 from typing import Optional
 
 
@@ -70,6 +71,16 @@ class Equipment:
         ref = {"file": file, "sheet": sheet, "row": row}
         if import_key:
             ref["import_key"] = import_key
+
+        signature = _source_ref_signature(ref)
+        existing_signatures = {
+            _source_ref_signature(existing)
+            for existing in refs
+            if isinstance(existing, dict)
+        }
+        if signature in existing_signatures:
+            return
+
         refs.append(ref)
         self.set_parsed_source_refs(refs)
 
@@ -135,3 +146,12 @@ def parse_source_refs(raw: str) -> list[dict]:
         return []
 
     return refs if isinstance(refs, list) else []
+
+
+def _source_ref_signature(ref: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Build a stable dedupe key for a source reference."""
+    file_name = str(ref.get("file", "")).strip()
+    sheet_name = str(ref.get("sheet", "")).strip()
+    row_value = str(ref.get("row", "")).strip()
+    import_key = str(ref.get("import_key", "")).strip()
+    return (file_name, sheet_name, row_value, import_key)

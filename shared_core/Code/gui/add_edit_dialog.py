@@ -639,15 +639,17 @@ class AddEditDialog(QDialog):
             eq.project_name = self.project_input.text().strip()
             eq.links = self.links_input.text().strip()
             eq.picture_path = self.picture_path_input.text().strip()
-            eq.lifecycle_status = "active"
-            eq.working_status = "unknown"
-            eq.estimated_age_years = None
-            eq.age_basis = "unknown"
-            eq.calibration_status = "unknown"
-            eq.last_calibration_date = ""
-            eq.calibration_due_date = ""
-            eq.calibration_vendor = ""
-            eq.calibration_cost = None
+
+            if not self.is_edit:
+                eq.lifecycle_status = "active"
+                eq.working_status = "unknown"
+                eq.estimated_age_years = None
+                eq.age_basis = "unknown"
+                eq.calibration_status = "unknown"
+                eq.last_calibration_date = ""
+                eq.calibration_due_date = ""
+                eq.calibration_vendor = ""
+                eq.calibration_cost = None
         else:
             age_value = parse_age_years(age_text)
             if age_text and age_value is None:

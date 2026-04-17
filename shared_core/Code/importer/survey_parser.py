@@ -1,6 +1,7 @@
 """Parser for the Survey workbook (.xlsx)."""
 
 import json
+import re
 from pathlib import Path
 
 import openpyxl
@@ -21,6 +22,63 @@ SECTION_LABELS = {
     "eng automated test sets": "ats_calibrated",
     "non working equipment":   "non_working",
 }
+
+SURVEY_HEADER_ALIASES = {
+    "blue_dot": [
+        "blue dot",
+        "blue dot no",
+        "blue dot number",
+        "blue dot #",
+        "bd",
+        "bd #",
+    ],
+    "asset_number": [
+        "asset number",
+        "asset #",
+        "asset no",
+        "asset",
+    ],
+    "serial_number": [
+        "serial number",
+        "serial #",
+        "serial no",
+        "serial",
+    ],
+    "manufacturer": [
+        "manufacturer",
+        "make",
+    ],
+    "model": [
+        "model",
+        "model no",
+        "model #",
+        "model number",
+        "part number",
+        "part no",
+    ],
+    "description": [
+        "description",
+        "item description",
+        "description / item",
+    ],
+    "chk_list": [
+        "chk list",
+        "check list",
+    ],
+    "location": [
+        "location",
+        "loc",
+    ],
+    "how_old": [
+        "how old is equip (years)",
+        "how old",
+        "age",
+        "age (years)",
+        "age years",
+    ],
+}
+
+HEADER_ROW_GUESS_LIMIT = 18
 
 # Expected column layout (0-based from the data I inspected)
 # Col A (1): Blue Dot
@@ -60,6 +118,71 @@ def _is_header_row(cell_values: list[str]) -> bool:
     return "asset number" in joined or "blue dot" in joined
 
 
+def _normalize_header(value: str) -> str:
+    """Normalize a header cell to a stable matching token."""
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", value.lower())
+    return " ".join(normalized.split())
+
+
+def _resolve_survey_columns(cell_values: list[str]) -> dict[str, int]:
+    """Infer survey column indexes from a header row with fallback to expected positions."""
+    if not cell_values:
+        return dict(SURVEY_COLS)
+
+    normalized_columns = []
+    for value in cell_values:
+        normalized_columns.append(_normalize_header(value.strip()))
+
+    normalized_map: dict[str, int] = {}
+    for index, header in enumerate(normalized_columns, start=1):
+        if not header:
+            continue
+        normalized_map[header] = index
+
+    column_indexes = dict(SURVEY_COLS)
+    for field, aliases in SURVEY_HEADER_ALIASES.items():
+        for alias in aliases:
+            alias = _normalize_header(alias)
+            if not alias:
+                continue
+            if alias in normalized_map:
+                column_indexes[field] = normalized_map[alias]
+                break
+            matched_index = next(
+                (
+                    index
+                    for header, index in normalized_map.items()
+                    if header.startswith(alias)
+                    or alias in header
+                ),
+                None,
+            )
+            if matched_index is not None:
+                column_indexes[field] = matched_index
+                break
+
+    return column_indexes
+
+
+def _build_column_indexes(ws) -> dict[str, int]:
+    """Find a header row and return column indexes."""
+    max_rows_to_scan = min(HEADER_ROW_GUESS_LIMIT, ws.max_row if ws.max_row else 1)
+    for row in range(1, max_rows_to_scan + 1):
+        vals = []
+        for col in range(1, min(15, ws.max_column + 1)):
+            value = ws.cell(row=row, column=col).value
+            vals.append(clean_value(value) if value is not None else "")
+
+        if not any(vals):
+            continue
+        if not _is_header_row(vals):
+            continue
+
+        return _resolve_survey_columns(vals)
+
+    return dict(SURVEY_COLS)
+
+
 def parse_survey(wb_path: Path) -> tuple[list[dict], list[ImportIssue]]:
     """Parse the survey workbook.
 
@@ -72,6 +195,7 @@ def parse_survey(wb_path: Path) -> tuple[list[dict], list[ImportIssue]]:
     """
     wb = openpyxl.load_workbook(str(wb_path), data_only=True)
     ws = wb[wb.sheetnames[0]]
+    column_indexes = _build_column_indexes(ws)
 
     rows: list[dict] = []
     issues: list[ImportIssue] = []
@@ -104,7 +228,7 @@ def parse_survey(wb_path: Path) -> tuple[list[dict], list[ImportIssue]]:
 
         # Extract fields by column position
         def col(name: str) -> str:
-            idx = SURVEY_COLS.get(name, 0)
+            idx = column_indexes.get(name, 0)
             return vals[idx - 1] if idx > 0 and idx <= len(vals) else ""
 
         asset = col("asset_number")
