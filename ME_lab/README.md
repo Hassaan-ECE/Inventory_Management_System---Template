@@ -34,7 +34,7 @@ The ME app reuses `shared_core` for the database, GUI, import pipeline, search, 
 
 Key ME settings today:
 
-- current internal prerelease version: `0.9.0`
+- current internal bug-fix prerelease version: `0.9.3`
 - builder / publisher: `Syed Hassaan Shah`
 - source workbook: `Data/Machine Shop Material list.xlsx`
 - database filename: `Data/me_lab_inventory.db` for source runs
@@ -92,20 +92,20 @@ When the database is empty, startup imports from `Data/Machine Shop Material lis
 
 ## Shared Release Layout
 
-The current shared ME release root is:
+The shared ME release root is:
 
 ```text
 S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME
 ```
 
-Expected layout:
+Expected layout after the next `0.9.3` publish:
 
 ```text
 ME\
 |-- current.json
 |-- backups\
 |-- releases\
-|   `-- 0.9.0\
+|   `-- 0.9.3\
 |       |-- ME_Lab_Inventory.exe
 |       |-- ME_Lab_Inventory_Setup.exe
 |       |-- release.json
@@ -121,6 +121,7 @@ Notes:
 - `shared\me_lab_shared.db` is created automatically once the shared-sync path is used
 - `backups\` stores shared DB snapshots before shared writes
 - `releases\<version>\` stores the published installer, raw exe, and release metadata
+- until you rebuild and republish, the live shared release on `S:` is still `0.9.0`
 
 ## Tests
 
@@ -150,13 +151,13 @@ python build.py
 Build the current internal prerelease installer:
 
 ```bash
-python build.py --version 0.9.0 --installer
+python build.py --version 0.9.3 --installer
 ```
 
 Build and publish a shared release bundle:
 
 ```bash
-python build.py --version 0.9.0 --installer --publish-shared --notes "Internal prerelease for ME shared-sync testing"
+python build.py --version 0.9.3 --installer --publish-shared --notes "Internal bug-fix prerelease for immediate shared-sync and updater testing"
 ```
 
 Useful build flags:
@@ -164,6 +165,7 @@ Useful build flags:
 - `--jobs 1` keeps Nuitka on a single compile job and is safer on lower-memory laptops
 - `--release-root <path>` publishes to a different shared root than the one in `app_config.py`
 - `--sign` signs the built exe and installer when the code-signing environment variables are configured
+- the build now refuses a mismatched `--version` by default; use the version from `app_config.py` unless you intentionally pass `--allow-version-mismatch`
 
 Build branding notes:
 
@@ -176,7 +178,7 @@ Build branding notes:
 Install the app from the published installer:
 
 ```text
-S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME\releases\0.9.0\ME_Lab_Inventory_Setup.exe
+S:\Manufacturing\Internal\_Syed_H_Shah\InventoryApps\ME\releases\0.9.3\ME_Lab_Inventory_Setup.exe
 ```
 
 The installer places the app in the user profile and registers a normal Windows uninstall entry.
