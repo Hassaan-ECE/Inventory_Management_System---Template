@@ -70,3 +70,27 @@ python build.py
 - `TE_Lab` is still useful as the most mature reference implementation when shared-core behavior needs comparison.
 - `Lab_Template` should be the base for future variants instead of copying a working lab folder wholesale.
 - Search, database behavior, exports, and most UI logic live in `shared_core`, so cross-variant changes usually belong there.
+
+## Latest Code Review (2026-04-17)
+
+### Findings
+
+- High: `AddEditDialog` currently resets several ME-specific fields during save in edit mode.
+  - File: `shared_core/Code/gui/add_edit_dialog.py`
+  - In ME layout save handling, lifecycle, working status, estimated age, and calibration fields are force-set to defaults even when editing existing records.
+- Medium: `Equipment.add_source_ref` appends source references without deduplication.
+  - File: `shared_core/Code/db/models.py`
+  - Re-running imports can duplicate identical source refs in the same record.
+- Medium: Survey import parsing is brittle to column-order changes.
+  - File: `shared_core/Code/importer/survey_parser.py`
+  - Fixed-position column mapping can silently mis-read rows when source headers change.
+- Low/Maintainability: app startup/build scripts are duplicated across variants.
+  - Files: `ME_lab/main.py`, `TE_Lab/main.py`, `Lab_Template/main.py`, and their `build.py` counterparts.
+  - Consider consolidating shared bootstrap/build behavior into `shared_core` helper modules.
+
+### Recommended implementation order
+
+1. Fix ME edit-save behavior so existing lifecycle/working/calibration/age values are preserved unless explicitly changed.
+2. Deduplicate source references in `Equipment.add_source_ref` (or during importer merge writeback).
+3. Refactor survey parsing to use header-aware column mapping with fallback aliases.
+4. Extract shared launcher/build scaffolding once all behavior is validated.
