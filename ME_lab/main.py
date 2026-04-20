@@ -9,12 +9,13 @@ if str(SHARED_ROOT) not in sys.path:
 
 from app_config import APP_CONFIG
 from Code.app_bootstrap import run_app, expected_source_files, StartupSplash
+from Code.db.database import get_database_path
 from Code.utils.runtime_paths import resolve_data_dir
 from source_launch import configure_source_db_path
 
 from Code.gui.main_window import MainWindow
 from Code.gui.theme import DEFAULT_THEME_NAME
-from Code.sync.service import shared_sync_enabled, sync_local_with_shared
+from Code.sync.service import run_excel_import, shared_sync_enabled, sync_local_from_shared
 from PySide6.QtWidgets import QMessageBox
 
 
@@ -38,7 +39,7 @@ def _run_startup_sync(app, conn, splash) -> None:
 
     splash.set_status("Checking shared workspace...")
     try:
-        sync_result = sync_local_with_shared(conn)
+        sync_result = sync_local_from_shared(conn, force=True)
         if sync_result.message:
             splash.set_status(sync_result.message)
             app.processEvents()
@@ -75,19 +76,25 @@ def _run_initial_import(app, _conn, splash: StartupSplash):
         app.processEvents()
 
     try:
-        from Code.importer.pipeline import run_full_import
+        if shared_sync_enabled():
+            local_db_path = get_database_path(_conn)
+            if local_db_path is None:
+                raise RuntimeError("Local database path is not available for startup import.")
+            stats = run_excel_import(local_db_path, data_dir, mode="full", progress_callback=on_progress)
+        else:
+            from Code.importer.pipeline import run_full_import
 
-        stats = run_full_import(data_dir, progress_callback=on_progress)
+            stats = run_full_import(data_dir, progress_callback=on_progress)
         splash.set_status("Import complete.")
 
         QMessageBox.information(
             None,
             "Import Complete",
             f"Successfully imported inventory data.\n\n"
-            f"Equipment records: {stats['base_records']}\n"
-            f"Survey matches: {stats['survey_matched']}\n"
-            f"Raw cells indexed: {stats['total_raw_cells']}\n"
-            f"Import issues to review: {stats['total_issues']}",
+            f"Equipment records: {stats.get('base_records', 0)}\n"
+            f"Survey matches: {stats.get('survey_matched', 0)}\n"
+            f"Raw cells indexed: {stats.get('total_raw_cells', 0)}\n"
+            f"Import issues to review: {stats.get('total_issues', 0)}",
         )
 
     except Exception as exc:

@@ -1,5 +1,6 @@
 """Dialog for adding and editing equipment records."""
 
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtGui import QDesktopServices, QPixmap
@@ -24,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_config import APP_CONFIG
-from Code.db.database import get_distinct_equipment_values, insert_equipment, update_equipment
+from Code.db.database import get_distinct_equipment_values
 from Code.db.models import Equipment
 from Code.gui.ui_components import CardWidget
 from Code.gui.window_branding import apply_window_branding
@@ -40,6 +41,7 @@ class AddEditDialog(QDialog):
         self.conn = conn
         self.equipment = equipment
         self.is_edit = equipment is not None
+        self.save_payload: dict | None = None
 
         entity_label = getattr(APP_CONFIG, "record_label", "Equipment")
         title_section = f"Edit {entity_label}" if self.is_edit else f"Add {entity_label}"
@@ -601,12 +603,12 @@ class AddEditDialog(QDialog):
     # ── Save ─────────────────────────────────────────────────────────────────
 
     def _on_save(self) -> None:
-        """Validate and save the equipment record."""
+        """Validate fields and emit a payload for the caller to persist."""
         manufacturer_raw = self.manufacturer_input.text().strip()
         age_text = self.age_input.text().strip() if hasattr(self, "age_input") else ""
 
         if self.is_edit:
-            eq = self.equipment
+            eq = replace(self.equipment)
         else:
             eq = Equipment()
             eq.manual_entry = True
@@ -686,14 +688,15 @@ class AddEditDialog(QDialog):
             )
             return
 
-        try:
-            if self.is_edit:
-                update_equipment(self.conn, eq)
-            else:
-                insert_equipment(self.conn, eq)
-            self.accept()
-        except Exception as exc:
-            QMessageBox.critical(self, "Save Error", f"Failed to save the record:\n{exc}")
+        self.save_payload = {
+            "action": "update" if self.is_edit else "insert",
+            "equipment": eq,
+        }
+        self.accept()
+
+    def get_save_payload(self) -> dict | None:
+        """Return the validated save payload built by _on_save."""
+        return self.save_payload
 
 
 # ── Layout helpers ───────────────────────────────────────────────────────────

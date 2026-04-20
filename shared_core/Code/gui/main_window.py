@@ -6,7 +6,7 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QFileSystemWatcher, QPoint, QThread, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -31,13 +31,15 @@ from PySide6.QtWidgets import (
 
 from app_config import APP_CONFIG
 from Code.db.database import (
-    delete_equipment,
+    delete_equipment as delete_equipment_local,
     get_distinct_equipment_values,
-    import_database_snapshot,
+    get_database_path,
+    import_database_snapshot as import_database_snapshot_local,
     get_equipment_by_id,
     get_equipment_stats,
+    insert_equipment as insert_equipment_local,
     search_equipment,
-    update_equipment,
+    update_equipment as update_equipment_local,
 )
 from Code.db.models import Equipment
 from Code.gui.equipment_table import (
@@ -47,7 +49,6 @@ from Code.gui.equipment_table import (
     VERIFY_COL,
     EquipmentTable,
     format_table_value,
-    verified_color,
 )
 from Code.gui.theme import (
     DEFAULT_THEME_NAME,
@@ -61,11 +62,18 @@ from Code.gui.window_branding import apply_window_branding
 from Code.importer.normalizer import normalize_manufacturer
 from Code.sync.service import (
     check_for_update,
+    create_equipment as create_equipment_shared,
+    delete_equipment as delete_equipment_shared,
+    import_database_into_shared as import_database_shared,
+    run_excel_import as run_excel_import_shared,
+    set_archived as set_archived_shared,
     shared_sync_enabled,
     sync_interval_ms,
-    sync_local_with_shared,
+    toggle_verified as toggle_verified_shared,
+    update_equipment as update_equipment_shared,
     update_checks_enabled,
 )
+from Code.sync.worker import GuiSyncWorker
 from Code.utils.equipment_fields import parse_age_years
 from Code.utils.runtime_paths import (
     bundle_root,
@@ -102,6 +110,12 @@ ARCHIVED_RECORD_SCOPE = "archived"
 class MainWindow(QMainWindow):
     """One-page, search-first equipment lookup window."""
 
+    request_startup_sync = Signal()
+    request_sync = Signal(bool, str)
+    request_revision_check = Signal(str)
+    request_reconnect = Signal()
+    request_shutdown_sync = Signal()
+
     def __init__(self, conn: sqlite3.Connection, initial_theme_name: str = DEFAULT_THEME_NAME, parent=None):
         super().__init__(parent)
         self.conn = conn
@@ -109,6 +123,9 @@ class MainWindow(QMainWindow):
         self._columns = active_columns()
         self._column_widths = {index + DATA_COL_START: width for index, (_, _, width) in enumerate(self._columns)}
         self._record_scope = ACTIVE_RECORD_SCOPE
+        self._sync_thread: QThread | None = None
+        self._sync_worker: GuiSyncWorker | None = None
+        self._shared_actions_available = not shared_sync_enabled()
 
         apply_window_branding(self)
         self._apply_initial_window_size()
@@ -133,6 +150,9 @@ class MainWindow(QMainWindow):
         self._periodic_sync_timer = QTimer(self)
         self._periodic_sync_timer.setInterval(sync_interval_ms())
         self._periodic_sync_timer.timeout.connect(lambda: self._run_shared_sync(quiet=True))
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setInterval(10000)
+        self._reconnect_timer.timeout.connect(lambda: self.request_reconnect.emit())
         self._shared_watcher = QFileSystemWatcher(self)
         self._shared_watcher.fileChanged.connect(self._on_shared_path_changed)
         self._shared_watcher.directoryChanged.connect(self._on_shared_path_changed)
@@ -141,6 +161,7 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._do_search()
         if shared_sync_enabled():
+            self._setup_sync_worker()
             self._refresh_shared_watch_paths()
             self._periodic_sync_timer.start()
         if shared_sync_enabled() or (update_checks_enabled() and is_compiled()):
@@ -200,11 +221,11 @@ class MainWindow(QMainWindow):
         self.theme_toggle_btn.clicked.connect(self._toggle_theme)
         header.addWidget(self.theme_toggle_btn)
 
-        import_btn = QPushButton("Import Data")
-        import_btn.setObjectName("secondaryButton")
-        import_btn.setToolTip("Merge from the Excel files or copy data from a shared .db file")
-        import_btn.clicked.connect(self._on_import_data)
-        header.addWidget(import_btn)
+        self.import_btn = QPushButton("Import Data")
+        self.import_btn.setObjectName("secondaryButton")
+        self.import_btn.setToolTip("Merge from the Excel files or copy data from a shared .db file")
+        self.import_btn.clicked.connect(self._on_import_data)
+        header.addWidget(self.import_btn)
 
         export_btn = QPushButton("Export Excel")
         export_btn.setObjectName("secondaryButton")
@@ -218,10 +239,10 @@ class MainWindow(QMainWindow):
         export_html_btn.clicked.connect(self._on_export_html)
         header.addWidget(export_html_btn)
 
-        add_btn = QPushButton(f"+ Add {record_label}")
-        add_btn.setObjectName("primaryButton")
-        add_btn.clicked.connect(self._on_add)
-        header.addWidget(add_btn)
+        self.add_btn = QPushButton(f"+ Add {record_label}")
+        self.add_btn.setObjectName("primaryButton")
+        self.add_btn.clicked.connect(self._on_add)
+        header.addWidget(self.add_btn)
 
         self._update_theme_toggle_button()
         root.addLayout(header)
@@ -360,6 +381,7 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self._update_status_bar()
+        self._set_shared_actions_enabled(self._shared_actions_available)
 
     def eventFilter(self, watched, event):
         """Force a reliable context menu for table cells on right-click."""
@@ -380,14 +402,372 @@ class MainWindow(QMainWindow):
         super().changeEvent(event)
 
     def closeEvent(self, event) -> None:
-        """Flush a pending local sync before the window closes."""
+        """Stop background sync timers and tear down the worker cleanly."""
         if shared_sync_enabled():
             self._foreground_sync_timer.stop()
             self._shared_change_sync_timer.stop()
-            if self._pending_sync_timer.isActive():
-                self._pending_sync_timer.stop()
-                self._run_shared_sync(quiet=True)
+            self._periodic_sync_timer.stop()
+            self._reconnect_timer.stop()
+            self._pending_sync_timer.stop()
+            self._teardown_sync_worker()
         super().closeEvent(event)
+
+    def _setup_sync_worker(self) -> None:
+        """Create a dedicated worker thread that owns sync runtime calls."""
+        if self._sync_worker is not None:
+            return
+
+        db_path = get_database_path(self.conn)
+        if db_path is None:
+            self.status_bar.showMessage("Shared sync unavailable: local database path not found.", 5000)
+            return
+
+        self._sync_thread = QThread(self)
+        self._sync_worker = GuiSyncWorker(db_path)
+        self._sync_worker.moveToThread(self._sync_thread)
+
+        self.request_startup_sync.connect(self._sync_worker.run_startup_sync)
+        self.request_sync.connect(self._sync_worker.run_sync)
+        self.request_revision_check.connect(self._sync_worker.run_revision_check)
+        self.request_reconnect.connect(self._sync_worker.run_reconnect)
+        self.request_shutdown_sync.connect(self._sync_worker.shutdown)
+
+        self._sync_worker.sync_completed.connect(self._on_sync_completed)
+        self._sync_worker.sync_failed.connect(self._on_sync_failed)
+        self._sync_worker.revision_checked.connect(self._on_revision_checked)
+        self._sync_worker.status_message.connect(self._on_worker_status_message)
+
+        self._sync_thread.start()
+
+    def _teardown_sync_worker(self) -> None:
+        """Stop and clean up the sync worker thread."""
+        if self._sync_worker is None or self._sync_thread is None:
+            return
+
+        self.request_shutdown_sync.emit()
+        self._sync_thread.quit()
+        self._sync_thread.wait(2500)
+        self._sync_worker.deleteLater()
+        self._sync_thread.deleteLater()
+        self._sync_worker = None
+        self._sync_thread = None
+
+    def _request_worker_sync(self, quiet: bool, reason: str) -> None:
+        """Request a background sync run from the worker thread."""
+        if not shared_sync_enabled() or self._sync_worker is None:
+            return
+        self.request_sync.emit(quiet, reason)
+
+    def _on_sync_completed(self, payload: dict) -> None:
+        """Refresh UI state after a worker sync operation completes."""
+        pulled = int(payload.get("pulled", 0) or 0)
+        busy = bool(payload.get("busy"))
+        shared_available = bool(payload.get("shared_available"))
+
+        if shared_available:
+            self._set_shared_actions_enabled(True)
+        elif not busy:
+            self._set_shared_actions_enabled(False)
+
+        if pulled:
+            self._do_search()
+            self._update_status_bar()
+        else:
+            self._refresh_view_tabs()
+            self._update_status_bar()
+
+        self._refresh_shared_watch_paths()
+        if busy or not shared_available:
+            if not self._reconnect_timer.isActive():
+                self._reconnect_timer.start()
+        else:
+            self._reconnect_timer.stop()
+
+    def _on_sync_failed(self, message: str, quiet: bool) -> None:
+        """Display worker sync failures while respecting quiet mode."""
+        del quiet
+        self._set_shared_actions_enabled(False)
+        self.status_bar.showMessage(message, 5000)
+        if not self._reconnect_timer.isActive():
+            self._reconnect_timer.start()
+
+    def _on_revision_checked(self, changed: bool, _token: str) -> None:
+        """Refresh from shared state when revision checks detect changes."""
+        if changed:
+            self._request_worker_sync(True, "revision")
+
+    def _on_worker_status_message(self, message: str, timeout_ms: int) -> None:
+        """Surface worker status updates in the status bar."""
+        if message:
+            self.status_bar.showMessage(message, timeout_ms)
+
+    def _set_shared_actions_enabled(self, enabled: bool) -> None:
+        """Enable mutating actions only while the shared workspace is reachable."""
+        active = bool(enabled) or not shared_sync_enabled()
+        self._shared_actions_available = active
+        if hasattr(self, "import_btn"):
+            self.import_btn.setEnabled(active)
+        if hasattr(self, "add_btn"):
+            self.add_btn.setEnabled(active)
+
+    def _can_modify_records(self, *, show_message: bool = True) -> bool:
+        """Return whether shared-backed record mutations are currently available."""
+        if not shared_sync_enabled():
+            return True
+        if self._shared_actions_available:
+            return True
+        if show_message:
+            self.status_bar.showMessage("Shared workspace unavailable. Viewing local cache only.", 5000)
+        return False
+
+    @staticmethod
+    def _mutation_dialog_title(action: str) -> str:
+        return {
+            "create": "Add Record Error",
+            "update": "Edit Record Error",
+            "archive": "Archive Record Error",
+            "restore": "Restore Record Error",
+            "delete": "Delete Record Error",
+            "verify": "Verify Error",
+            "quick_edit": "Quick Edit Error",
+        }.get(action, "Record Update Error")
+
+    @staticmethod
+    def _mutation_error_prefix(action: str) -> str:
+        return {
+            "create": "Could not add the record:",
+            "update": "Could not save the record:",
+            "archive": "Could not archive the record:",
+            "restore": "Could not restore the record:",
+            "delete": "Could not delete the record:",
+            "verify": "Failed to update verification:",
+            "quick_edit": "Failed to update the field:",
+        }.get(action, "Could not update the record:")
+
+    @staticmethod
+    def _mutation_success_message(action: str) -> str:
+        return {
+            "create": "Record added.",
+            "update": "Record updated.",
+            "archive": "Record archived.",
+            "restore": "Record restored from archive.",
+            "delete": "Record deleted.",
+            "verify": "Verification updated.",
+            "quick_edit": "Field updated.",
+        }.get(action, "Record updated.")
+
+    @staticmethod
+    def _stats_value(stats: object, key: str, default=0):
+        if isinstance(stats, dict):
+            return stats.get(key, default)
+        return getattr(stats, key, default)
+
+    def _format_import_success_message(self, import_kind: str, stats: object) -> str:
+        """Build the import completion summary shown to the user."""
+        if import_kind == "db_snapshot":
+            header = (
+                "Imported the selected database into the shared workspace and refreshed the local snapshot."
+                if shared_sync_enabled()
+                else "This computer's local database now matches the selected snapshot."
+            )
+            return (
+                f"{header}\n\n"
+                f"Equipment records: {self._stats_value(stats, 'equipment_records')}\n"
+                f"Raw cells: {self._stats_value(stats, 'raw_cells')}\n"
+                f"Import issues: {self._stats_value(stats, 'import_issues')}"
+            )
+
+        footer = (
+            "The shared workspace and local snapshot were updated."
+            if shared_sync_enabled()
+            else "The local database has been updated."
+        )
+        return (
+            f"Parsed rows: {self._stats_value(stats, 'parsed_records', self._stats_value(stats, 'base_records'))}\n"
+            f"Added records: {self._stats_value(stats, 'added_records')}\n"
+            f"Merged into existing: {self._stats_value(stats, 'matched_records')}\n"
+            f"Updated existing records: {self._stats_value(stats, 'updated_records')}\n"
+            f"Merge conflicts: {self._stats_value(stats, 'merge_conflicts')}\n"
+            f"Survey matched: {self._stats_value(stats, 'survey_matched')}\n"
+            f"Raw cells indexed: {self._stats_value(stats, 'total_raw_cells')}\n"
+            f"Issues: {self._stats_value(stats, 'total_issues')}\n\n"
+            f"{footer}"
+        )
+
+    def _submit_create_equipment(self, equipment: Equipment, action: str = "create") -> None:
+        """Persist a new record through the active runtime path."""
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                create_equipment_shared(self.conn, equipment)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+            return
+        insert_equipment_local(self.conn, equipment)
+        self._do_search()
+        self._update_status_bar()
+        self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+
+    def _submit_update_equipment(self, equipment: Equipment, action: str = "update") -> None:
+        """Persist an updated record through the active runtime path."""
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                update_equipment_shared(self.conn, equipment)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+            return
+        update_equipment_local(self.conn, equipment)
+        self._do_search()
+        self._update_status_bar()
+        self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+
+    def _submit_archive_change(self, record_uuid: str, archived: bool) -> None:
+        """Persist archive-state changes through the appropriate runtime path."""
+        action = "archive" if archived else "restore"
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                set_archived_shared(self.conn, record_uuid, archived)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+            return
+        eq = self._equipment_for_record_uuid(record_uuid)
+        if eq is None:
+            raise KeyError(f"Equipment record not found: {record_uuid}")
+        eq.is_archived = archived
+        update_equipment_local(self.conn, eq)
+        self._do_search()
+        self._update_status_bar()
+        self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+
+    def _submit_delete_record(self, record_id: int, record_uuid: str) -> None:
+        """Delete a record through the active runtime path."""
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                delete_equipment_shared(self.conn, record_uuid)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            self.status_bar.showMessage(self._mutation_success_message("delete"), 3000)
+            return
+        delete_equipment_local(self.conn, record_id)
+        self._do_search()
+        self._update_status_bar()
+        self.status_bar.showMessage(self._mutation_success_message("delete"), 3000)
+
+    def _submit_toggle_verified(self, record_uuid: str) -> None:
+        """Toggle verification through the active runtime path."""
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                toggle_verified_shared(self.conn, record_uuid)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            self.status_bar.showMessage(self._mutation_success_message("verify"), 3000)
+            return
+        eq = self._equipment_for_record_uuid(record_uuid)
+        if eq is None:
+            raise KeyError(f"Equipment record not found: {record_uuid}")
+        eq.verified_in_survey = not eq.verified_in_survey
+        update_equipment_local(self.conn, eq)
+        self._do_search()
+        self._update_status_bar()
+        self.status_bar.showMessage(self._mutation_success_message("verify"), 3000)
+
+    def _submit_excel_import(self, data_dir: Path, mode: str = "merge") -> None:
+        """Run an Excel import through the active runtime path."""
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                stats = run_excel_import_shared(self.conn, data_dir, mode=mode)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            QMessageBox.information(self, "Import Complete", self._format_import_success_message(f"excel_{mode}", stats))
+            return
+
+        from Code.importer.pipeline import run_merge_import, run_full_import
+
+        runner = run_merge_import if mode == "merge" else run_full_import
+        stats = runner(data_dir)
+        self._do_search()
+        self._update_status_bar()
+        QMessageBox.information(self, "Import Complete", self._format_import_success_message(f"excel_{mode}", stats))
+
+    def _submit_database_import(self, source_path: Path) -> None:
+        """Run a database import through the active runtime path."""
+        if shared_sync_enabled():
+            if not self._can_modify_records():
+                return
+            try:
+                stats = import_database_shared(self.conn, source_path)
+            except TimeoutError as exc:
+                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
+                return
+            except ConnectionError as exc:
+                self._set_shared_actions_enabled(False)
+                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
+                return
+            self._do_search()
+            self._update_status_bar()
+            QMessageBox.information(self, "Import Complete", self._format_import_success_message("db_snapshot", stats))
+            return
+
+        stats = import_database_snapshot_local(self.conn, source_path)
+        self._do_search()
+        self._update_status_bar()
+        QMessageBox.information(self, "Import Complete", self._format_import_success_message("db_snapshot", stats))
 
     def _schedule_search(self) -> None:
         """Debounce search/filter changes."""
@@ -455,7 +835,7 @@ class MainWindow(QMainWindow):
     def _run_startup_maintenance(self) -> None:
         """Run lightweight startup tasks after the window is visible."""
         if shared_sync_enabled():
-            self._run_shared_sync(quiet=True)
+            self.request_startup_sync.emit()
         if update_checks_enabled() and is_compiled():
             self._prompt_for_available_update()
 
@@ -561,36 +941,11 @@ class MainWindow(QMainWindow):
         self._shared_change_sync_timer.start()
 
     def _run_shared_sync(self, quiet: bool = False) -> None:
-        """Synchronize the local database with the shared workspace."""
+        """Request a background revision check and pull when needed."""
         if not shared_sync_enabled():
             return
-
-        try:
-            result = sync_local_with_shared(self.conn)
-        except Exception as exc:
-            if quiet:
-                self.status_bar.showMessage(f"Shared sync skipped: {exc}", 5000)
-            else:
-                QMessageBox.warning(self, "Shared Sync", f"Shared sync failed:\n{exc}")
-            return
-
-        if result.pulled or result.initialized == "local":
-            self._do_search()
-            self._update_status_bar()
-        elif result.pushed:
-            self._refresh_view_tabs()
-            self._update_status_bar()
-
-        self._refresh_shared_watch_paths()
-
-        if result.conflicts:
-            self.status_bar.showMessage(result.message or "Shared sync found conflicts to review.", 7000)
-            return
-
-        if not quiet and result.message:
-            self.status_bar.showMessage(result.message, 5000)
-        elif quiet and (result.pulled or result.pushed or result.initialized):
-            self.status_bar.showMessage(result.message, 5000)
+        del quiet
+        self.request_revision_check.emit("periodic")
 
     def _do_search(self) -> None:
         """Run the search query and populate the results table."""
@@ -746,6 +1101,11 @@ class MainWindow(QMainWindow):
 
         open_record_action = menu.addAction("Open Full Record")
         archive_action = menu.addAction("Restore Record" if self._is_archive_view() else "Archive Record")
+        can_modify = self._can_modify_records(show_message=False)
+        if quick_edit_action is not None:
+            quick_edit_action.setEnabled(can_modify)
+        open_record_action.setEnabled(can_modify)
+        archive_action.setEnabled(can_modify)
         menu.addSeparator()
         search_online_action = menu.addAction("Search Online")
         search_year_action = None
@@ -755,6 +1115,7 @@ class MainWindow(QMainWindow):
             copy_info_action = menu.addAction("Copy Age Search")
         menu.addSeparator()
         delete_action = menu.addAction("Delete Record")
+        delete_action.setEnabled(can_modify)
 
         chosen_action = menu.exec(self.table.viewport().mapToGlobal(position))
         if chosen_action is None:
@@ -776,6 +1137,8 @@ class MainWindow(QMainWindow):
 
     def _quick_edit_cell(self, row: int, column_index: int) -> None:
         """Edit a single visible field using a field-aware prompt."""
+        if not self._can_modify_records():
+            return
         record_id = self.table.record_id_for_row(row)
         if record_id is None:
             return
@@ -848,24 +1211,36 @@ class MainWindow(QMainWindow):
             setattr(eq, field, new_value)
 
         try:
-            update_equipment(self.conn, eq)
-            self._do_search()
-            self._update_status_bar()
-            self._schedule_shared_sync()
+            self._submit_update_equipment(eq, action="quick_edit")
         except Exception as exc:
             QMessageBox.critical(self, "Quick Edit Error", f"Failed to update {label}:\n{exc}")
 
     def _on_add(self) -> None:
+        if not self._can_modify_records():
+            return
         from Code.gui.add_edit_dialog import AddEditDialog
 
         dialog = AddEditDialog(self.conn, parent=self)
-        if dialog.exec():
-            self._do_search()
-            self._update_status_bar()
-            self._schedule_shared_sync()
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        payload = dialog.get_save_payload()
+        if not payload:
+            return
+
+        equipment = payload.get("equipment")
+        if not isinstance(equipment, Equipment):
+            return
+
+        try:
+            self._submit_create_equipment(equipment)
+        except Exception as exc:
+            QMessageBox.critical(self, "Add Record Error", f"Could not add the record:\n{exc}")
 
     def _set_row_archived(self, row: int, archived: bool) -> None:
         """Archive or restore the selected record and refresh the current view."""
+        if not self._can_modify_records():
+            return
         eq = self._equipment_for_row(row)
         if eq is None or eq.is_archived == archived:
             return
@@ -887,18 +1262,14 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        eq.is_archived = archived
         try:
-            update_equipment(self.conn, eq)
-            self._do_search()
-            self._update_status_bar()
-            self._schedule_shared_sync()
-            status = "Record restored from archive." if not archived else "Record archived."
-            self.status_bar.showMessage(status, 3000)
+            self._submit_archive_change(eq.record_uuid, archived)
         except Exception as exc:
             QMessageBox.critical(self, title, f"Could not update the archive state:\n{exc}")
 
     def _on_edit(self) -> None:
+        if not self._can_modify_records():
+            return
         row = self.table.currentRow()
         if row < 0:
             return
@@ -913,12 +1284,25 @@ class MainWindow(QMainWindow):
         from Code.gui.add_edit_dialog import AddEditDialog
 
         dialog = AddEditDialog(self.conn, equipment=eq, parent=self)
-        if dialog.exec():
-            self._do_search()
-            self._update_status_bar()
-            self._schedule_shared_sync()
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        payload = dialog.get_save_payload()
+        if not payload:
+            return
+
+        equipment = payload.get("equipment")
+        if not isinstance(equipment, Equipment):
+            return
+
+        try:
+            self._submit_update_equipment(equipment)
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit Record Error", f"Could not save the record:\n{exc}")
 
     def _on_delete(self) -> None:
+        if not self._can_modify_records():
+            return
         row = self.table.currentRow()
         if row < 0:
             return
@@ -926,6 +1310,8 @@ class MainWindow(QMainWindow):
         record_id = self.table.record_id_for_row(row)
         if record_id is None:
             return
+        eq = get_equipment_by_id(self.conn, record_id)
+        record_uuid = (eq.record_uuid if eq is not None else "").strip()
         reply = QMessageBox.question(
             self,
             "Delete Equipment",
@@ -934,10 +1320,10 @@ class MainWindow(QMainWindow):
             QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            delete_equipment(self.conn, record_id)
-            self._do_search()
-            self._update_status_bar()
-            self._schedule_shared_sync()
+            try:
+                self._submit_delete_record(record_id, record_uuid)
+            except Exception as exc:
+                QMessageBox.critical(self, "Delete Record Error", f"Could not delete the record:\n{exc}")
 
     def _on_cell_clicked(self, row: int, column: int) -> None:
         """Handle single clicks on the verify action column."""
@@ -957,6 +1343,20 @@ class MainWindow(QMainWindow):
             return None
 
         return get_equipment_by_id(self.conn, record_id)
+
+    def _equipment_for_record_uuid(self, record_uuid: str) -> Equipment | None:
+        """Fetch an equipment record by UUID from the current local cache."""
+        normalized_uuid = (record_uuid or "").strip()
+        if not normalized_uuid:
+            return None
+        row = self.conn.execute(
+            "SELECT record_id FROM equipment WHERE record_uuid=? LIMIT 1",
+            (normalized_uuid,),
+        ).fetchone()
+        if row is None:
+            return None
+        record_id = row["record_id"] if hasattr(row, "keys") else row[0]
+        return get_equipment_by_id(self.conn, int(record_id))
 
     def _format_table_value(self, field: str, raw_value) -> str:
         """Convert raw field values into compact table text."""
@@ -1049,6 +1449,8 @@ class MainWindow(QMainWindow):
 
     def _toggle_verify(self, row: int) -> None:
         """Toggle the verified_in_survey flag for the equipment at this row."""
+        if not self._can_modify_records():
+            return
         item = self.table.item(row, VERIFY_COL)
         if item is None:
             return
@@ -1060,24 +1462,11 @@ class MainWindow(QMainWindow):
         if eq is None:
             return
 
-        eq.verified_in_survey = not eq.verified_in_survey
-
         try:
-            update_equipment(self.conn, eq)
+            self._submit_toggle_verified(eq.record_uuid)
         except Exception as exc:
             QMessageBox.critical(self, "Verify Error", f"Failed to update verification:\n{exc}")
             return
-
-        # Update the cell visually without a full table refresh
-        if eq.verified_in_survey:
-            item.setText("\u2713")
-            item.setForeground(verified_color(self._theme_name, True))
-        else:
-            item.setText("")
-            item.setForeground(verified_color(self._theme_name, False))
-
-        self._update_status_bar()
-        self._schedule_shared_sync()
 
     def _copy_equipment_info(self, row: int) -> None:
         """Copy an age-search phrase to the clipboard."""
@@ -1160,14 +1549,21 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Error", f"HTML export failed:\n{exc}")
 
     def _on_import_data(self) -> None:
+        if not self._can_modify_records():
+            return
         workbook_label = "source workbook" if not APP_CONFIG.survey_source_file else "source spreadsheets"
+        target_label = (
+            "the shared workspace"
+            if shared_sync_enabled()
+            else "this computer's database"
+        )
         dialog = QMessageBox(self)
         apply_window_branding(dialog, "Import Data")
         dialog.setIcon(QMessageBox.Question)
-        dialog.setText("Choose what to import into this computer's database.")
+        dialog.setText(f"Choose what to import into {target_label}.")
         dialog.setInformativeText(
             f"Excel import merges/adds from the {workbook_label}.\n"
-            f"Database import copies data from a shared {APP_CONFIG.database_label} file."
+            f"Database import copies data from a selected {APP_CONFIG.database_label} file."
         )
         excel_button = dialog.addButton("Merge Excel Files", QMessageBox.AcceptRole)
         db_button = dialog.addButton("Import .db File", QMessageBox.ActionRole)
@@ -1183,13 +1579,15 @@ class MainWindow(QMainWindow):
     def _on_reimport_from_excel(self) -> None:
         if APP_CONFIG.survey_source_file:
             message = (
-                "This will re-parse both Excel source files and merge them into this computer's database.\n"
-                "Existing records stay in place, matching records are updated conservatively, and new records are added.\n\nContinue?"
+                "This will re-parse both Excel source files and merge them into the shared database.\n"
+                "Existing shared records stay in place, matching records are updated conservatively, and new records are added.\n"
+                "After the import finishes, the local snapshot will be refreshed.\n\nContinue?"
             )
         else:
             message = (
-                "This will re-parse the current Excel source workbook and merge it into this computer's database.\n"
-                "Existing records stay in place, matching records are updated conservatively, and new records are added.\n\nContinue?"
+                "This will re-parse the current Excel source workbook and merge it into the shared database.\n"
+                "Existing shared records stay in place, matching records are updated conservatively, and new records are added.\n"
+                "After the import finishes, the local snapshot will be refreshed.\n\nContinue?"
             )
         reply = QMessageBox.question(
             self,
@@ -1202,29 +1600,13 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from Code.importer.pipeline import run_merge_import
-
-            data_dir = resolve_data_dir()
-            stats = run_merge_import(data_dir)
-            self._do_search()
-            self._update_status_bar()
-            self._schedule_shared_sync()
-            QMessageBox.information(
-                self,
-                "Import Complete",
-                f"Parsed rows: {stats['parsed_records']}\n"
-                f"Added records: {stats['added_records']}\n"
-                f"Merged into existing: {stats['matched_records']}\n"
-                f"Updated existing records: {stats['updated_records']}\n"
-                f"Merge conflicts: {stats['merge_conflicts']}\n"
-                f"Survey matched: {stats['survey_matched']}\n"
-                f"Raw cells indexed: {stats['total_raw_cells']}\n"
-                f"Issues: {stats['total_issues']}",
-            )
+            self._submit_excel_import(resolve_data_dir(), mode="merge")
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", f"Import failed:\n{exc}")
 
     def _on_import_from_db_file(self) -> None:
+        if not self._can_modify_records():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
             f"Choose {APP_CONFIG.display_name} Database",
@@ -1237,9 +1619,8 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self,
             "Import Database File",
-            "This will replace this computer's current local database with the data from the selected file.\n"
-            "After the import finishes, the selected file is no longer needed.\n"
-            "Any local manual additions or edits will be lost.\n\nContinue?",
+            "This will replace the shared database snapshot with the data from the selected file.\n"
+            "After the import finishes, this computer's local snapshot will be refreshed from shared.\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1247,19 +1628,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            from pathlib import Path
-
-            stats = import_database_snapshot(self.conn, Path(path))
-            self._do_search()
-            self._update_status_bar()
-            QMessageBox.information(
-                self,
-                "Import Complete",
-                f"Copied {stats['equipment_records']} equipment records into this computer's database.\n"
-                f"Raw cells: {stats['raw_cells']}\n"
-                f"Import issues: {stats['import_issues']}\n\n"
-                "You can delete the shared .db file after this import.",
-            )
+            self._submit_database_import(Path(path))
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", f"Import failed:\n{exc}")
 

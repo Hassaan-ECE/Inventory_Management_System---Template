@@ -26,7 +26,7 @@ class AddEditDialogPictureTests(unittest.TestCase):
         self.conn.close()
         self.temp_dir.cleanup()
 
-    def test_me_dialog_uses_picture_section_and_saves_picture_path(self) -> None:
+    def test_me_dialog_uses_picture_section_and_builds_picture_payload(self) -> None:
         dialog = AddEditDialog(self.conn)
         try:
             self.assertTrue(hasattr(dialog, "picture_path_input"))
@@ -48,17 +48,21 @@ class AddEditDialogPictureTests(unittest.TestCase):
             dialog.picture_path_input.setText(r"C:\images\fixture-cart.png")
 
             dialog._on_save()
+            payload = dialog.get_save_payload()
+
+            self.assertIsNotNone(payload)
+            self.assertEqual(payload["action"], "insert")
+            equipment = payload["equipment"]
+            self.assertEqual(equipment.picture_path, r"C:\images\fixture-cart.png")
+            self.assertEqual(equipment.calibration_status, "unknown")
+            self.assertEqual(equipment.qty, 4.0)
+            self.assertEqual(equipment.project_name, "AALC Line Upgrade")
+            self.assertEqual(equipment.links, "https://vendor.example/fixture-cart")
 
             row = self.conn.execute(
-                "SELECT picture_path, calibration_status, qty, project_name, links "
-                "FROM equipment WHERE asset_number='ME-100'"
+                "SELECT COUNT(*) FROM equipment WHERE asset_number='ME-100'"
             ).fetchone()
-            self.assertIsNotNone(row)
-            self.assertEqual(row["picture_path"], r"C:\images\fixture-cart.png")
-            self.assertEqual(row["calibration_status"], "unknown")
-            self.assertEqual(row["qty"], 4.0)
-            self.assertEqual(row["project_name"], "AALC Line Upgrade")
-            self.assertEqual(row["links"], "https://vendor.example/fixture-cart")
+            self.assertEqual(row[0], 0)
 
             dialog.picture_path_input.clear()
             self.assertEqual(dialog.picture_preview.text(), "No picture selected")

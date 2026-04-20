@@ -1,312 +1,47 @@
-"""Local-first shared sync and update checks for internal inventory apps."""
+"""Shared-first sync facade for inventory apps that share a network database."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import sqlite3
-import shutil
-import socket
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
+from typing import Any, Mapping
 
 from app_config import APP_CONFIG
 from Code.db.database import (
-    _build_equipment_search_text,
     create_tables,
+    delete_equipment as delete_equipment_local,
+    fetch_equipment_snapshot,
+    fetch_import_issue_snapshot,
+    fetch_raw_cell_snapshot,
     get_all_equipment,
     get_connection,
     get_database_path,
+    get_equipment_by_uuid,
     import_database_snapshot,
+    insert_equipment,
+    load_sync_state,
+    replace_local_snapshot,
+    set_sync_state,
+    update_equipment as update_equipment_local,
 )
 from Code.db.models import Equipment
-from Code.importer.matching import build_equipment_indexes, resolve_equipment_match
+from Code.importer.pipeline import run_full_import_to_db, run_merge_import_to_db
+from Code.sync.contracts import RevisionInfo, SharedStatus, SyncResult
+from Code.sync.update_checks import UpdateInfo, check_for_update, update_checks_enabled
 from Code.utils.runtime_paths import (
-    shared_backup_dir,
-    shared_database_dir,
-    shared_db_path,
-    shared_lock_path,
-    shared_release_manifest_path,
-    shared_root_dir,
+    resolve_db_path,
+    shared_database_dir as runtime_shared_database_dir,
+    shared_db_path as runtime_shared_db_path,
+    shared_root_dir as runtime_shared_root_dir,
 )
 
-_LOCK_STALE_SECONDS = 15 * 60
-_SYNC_HASH_FIELDS = (
-    "asset_number",
-    "serial_number",
-    "manufacturer",
-    "manufacturer_raw",
-    "model",
-    "description",
-    "qty",
-    "location",
-    "assigned_to",
-    "ownership_type",
-    "rental_vendor",
-    "rental_cost_monthly",
-    "calibration_status",
-    "last_calibration_date",
-    "calibration_due_date",
-    "calibration_vendor",
-    "calibration_cost",
-    "lifecycle_status",
-    "working_status",
-    "condition",
-    "acquired_date",
-    "estimated_age_years",
-    "age_basis",
-    "verified_in_survey",
-    "blue_dot_ref",
-    "project_name",
-    "picture_path",
-    "links",
-    "notes",
-    "manual_entry",
-    "is_archived",
-    "source_refs",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class SyncResult:
-    enabled: bool = False
-    shared_available: bool = False
-    initialized: str = ""
-    pushed: int = 0
-    pulled: int = 0
-    conflicts: int = 0
-    message: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class UpdateInfo:
-    version: str
-    installer_path: Path
-    published_at: str = ""
-    notes: str = ""
+_UNAVAILABLE_MESSAGE = "Shared workspace unavailable. Viewing local cache only."
+_BUSY_MESSAGE = "Shared workspace busy, retry in a moment."
 
 
 def shared_sync_enabled() -> bool:
     """Return whether this app variant is configured to use shared sync."""
     return bool(getattr(APP_CONFIG, "enable_shared_sync", False))
-
-
-def update_checks_enabled() -> bool:
-    """Return whether this app variant should look for newer releases."""
-    return bool(getattr(APP_CONFIG, "enable_update_checks", False))
-
-
-def sync_local_with_shared(local_conn, override_root: Path | None = None) -> SyncResult:
-    """Merge the local database with the configured shared database when safe."""
-    if not shared_sync_enabled():
-        return SyncResult(message="Shared sync is disabled for this app.")
-
-    root = _resolve_shared_root(override_root)
-    if root is None:
-        return SyncResult(enabled=True, message="Shared sync path is not configured.")
-    if not root.exists():
-        return SyncResult(enabled=True, message="Shared workspace is unavailable right now.")
-
-    try:
-        shared_dir = _resolve_shared_database_dir(override_root, create=True)
-        backups_dir = _resolve_shared_backup_dir(override_root, create=True)
-        shared_path = _resolve_shared_db_path(override_root)
-        lock_path = _resolve_shared_lock_path(override_root)
-    except OSError:
-        return SyncResult(enabled=True, message="Shared workspace is unavailable right now.")
-
-    if shared_dir is None or backups_dir is None or shared_path is None or lock_path is None:
-        return SyncResult(enabled=True, message="Shared sync paths could not be resolved.")
-
-    local_path = get_database_path(local_conn)
-    if local_path is None:
-        return SyncResult(enabled=True, shared_available=True, message="Local database path could not be resolved.")
-
-    create_tables(local_conn)
-
-    try:
-        with _shared_lock(lock_path):
-            shared_conn = get_connection(shared_path, use_wal=False)
-            try:
-                create_tables(shared_conn)
-                backed_up_shared = False
-
-                shared_changed = _dedupe_exact_equipment_rows(shared_conn)
-                if shared_changed and not backed_up_shared:
-                    _backup_shared_db(shared_path, backups_dir)
-                    backed_up_shared = True
-
-                local_count = _equipment_count(local_conn)
-                shared_count = _equipment_count(shared_conn)
-
-                if local_count == 0 and shared_count > 0:
-                    import_database_snapshot(local_conn, shared_path)
-                    create_tables(local_conn)
-                    _rebuild_local_sync_state(local_conn)
-                    return SyncResult(
-                        enabled=True,
-                        shared_available=True,
-                        initialized="local",
-                        pulled=shared_count,
-                        message=f"Pulled {shared_count} shared records into this computer's database.",
-                    )
-
-                if shared_count == 0 and local_count > 0:
-                    import_database_snapshot(shared_conn, local_path)
-                    create_tables(shared_conn)
-                    _rebuild_local_sync_state(local_conn)
-                    return SyncResult(
-                        enabled=True,
-                        shared_available=True,
-                        initialized="shared",
-                        pushed=local_count,
-                        message=f"Published {local_count} local records to the shared database.",
-                    )
-
-                _dedupe_exact_equipment_rows(local_conn)
-                _align_local_records_to_shared(local_conn, shared_conn)
-
-                state_by_uuid = _load_record_sync_state(local_conn)
-                local_rows = {eq.record_uuid: eq for eq in get_all_equipment(local_conn, archived="all") if eq.record_uuid}
-                shared_rows = {eq.record_uuid: eq for eq in get_all_equipment(shared_conn, archived="all") if eq.record_uuid}
-
-                pushed = 0
-                pulled = 0
-                conflicts = 0
-                backed_up_shared = backed_up_shared or shared_changed
-
-                for record_uuid in sorted(set(local_rows) | set(shared_rows)):
-                    local_eq = local_rows.get(record_uuid)
-                    shared_eq = shared_rows.get(record_uuid)
-                    local_hash = _equipment_sync_hash(local_eq) if local_eq is not None else ""
-                    shared_hash = _equipment_sync_hash(shared_eq) if shared_eq is not None else ""
-                    last_hash = state_by_uuid.get(record_uuid, "")
-
-                    if not last_hash:
-                        if local_hash and shared_hash:
-                            if local_hash == shared_hash:
-                                _set_record_sync_state(local_conn, record_uuid, local_hash)
-                                _resolve_conflict(local_conn, record_uuid)
-                            else:
-                                _record_conflict(local_conn, record_uuid, local_hash, shared_hash, last_hash)
-                                conflicts += 1
-                        elif local_hash:
-                            if not backed_up_shared:
-                                _backup_shared_db(shared_path, backups_dir)
-                                backed_up_shared = True
-                            _upsert_equipment_by_uuid(shared_conn, local_eq)
-                            _set_record_sync_state(local_conn, record_uuid, local_hash)
-                            _resolve_conflict(local_conn, record_uuid)
-                            pushed += 1
-                        elif shared_hash:
-                            _upsert_equipment_by_uuid(local_conn, shared_eq)
-                            _set_record_sync_state(local_conn, record_uuid, shared_hash)
-                            _resolve_conflict(local_conn, record_uuid)
-                            pulled += 1
-                        continue
-
-                    if local_hash == last_hash and shared_hash == last_hash:
-                        continue
-
-                    if local_hash == last_hash:
-                        if shared_eq is None:
-                            _delete_equipment_by_uuid(local_conn, record_uuid)
-                            _clear_record_sync_state(local_conn, record_uuid)
-                        else:
-                            _upsert_equipment_by_uuid(local_conn, shared_eq)
-                            _set_record_sync_state(local_conn, record_uuid, shared_hash)
-                        _resolve_conflict(local_conn, record_uuid)
-                        pulled += 1
-                        continue
-
-                    if shared_hash == last_hash:
-                        if not backed_up_shared:
-                            _backup_shared_db(shared_path, backups_dir)
-                            backed_up_shared = True
-                        if local_eq is None:
-                            _delete_equipment_by_uuid(shared_conn, record_uuid)
-                            _clear_record_sync_state(local_conn, record_uuid)
-                        else:
-                            _upsert_equipment_by_uuid(shared_conn, local_eq)
-                            _set_record_sync_state(local_conn, record_uuid, local_hash)
-                        _resolve_conflict(local_conn, record_uuid)
-                        pushed += 1
-                        continue
-
-                    if local_hash == shared_hash:
-                        _set_record_sync_state(local_conn, record_uuid, local_hash)
-                        _resolve_conflict(local_conn, record_uuid)
-                        continue
-
-                    _record_conflict(local_conn, record_uuid, local_hash, shared_hash, last_hash)
-                    conflicts += 1
-
-                local_conn.commit()
-                shared_conn.commit()
-
-                if conflicts:
-                    message = (
-                        f"Synced {pushed} local and {pulled} shared changes. "
-                        f"{conflicts} conflict{'s' if conflicts != 1 else ''} need review."
-                    )
-                elif pushed or pulled:
-                    message = f"Synced {pushed} local and {pulled} shared changes."
-                else:
-                    message = "Already up to date with the shared database."
-
-                return SyncResult(
-                    enabled=True,
-                    shared_available=True,
-                    pushed=pushed,
-                    pulled=pulled,
-                    conflicts=conflicts,
-                    message=message,
-                )
-            finally:
-                shared_conn.close()
-    except TimeoutError:
-        return SyncResult(enabled=True, shared_available=True, message="Another computer is syncing right now.")
-    except (OSError, sqlite3.DatabaseError):
-        return SyncResult(enabled=True, message="Shared workspace is unavailable right now.")
-
-
-def check_for_update(override_root: Path | None = None) -> UpdateInfo | None:
-    """Return update information when a newer release is published on the shared drive."""
-    if not update_checks_enabled():
-        return None
-
-    manifest_path = _resolve_release_manifest_path(override_root)
-    if manifest_path is None or not manifest_path.exists():
-        return None
-
-    try:
-        data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
-    version = str(data.get("version", "")).strip()
-    installer_raw = str(data.get("installer_path", "")).strip()
-    if not version or not installer_raw:
-        return None
-
-    if _compare_versions(version, getattr(APP_CONFIG, "app_version", "0.0.0")) <= 0:
-        return None
-
-    installer_path = Path(installer_raw)
-    if not installer_path.is_absolute():
-        installer_path = manifest_path.parent / installer_path
-    if not installer_path.exists():
-        return None
-
-    return UpdateInfo(
-        version=version,
-        installer_path=installer_path,
-        published_at=str(data.get("published_at", "")).strip(),
-        notes=str(data.get("notes", "")).strip(),
-    )
 
 
 def sync_interval_ms() -> int:
@@ -319,462 +54,720 @@ def sync_interval_ms() -> int:
     return max(5000, interval_ms)
 
 
-def _resolve_shared_root(override_root: Path | None = None) -> Path | None:
-    if override_root is not None:
-        return Path(override_root)
-    return shared_root_dir()
+def shared_dir(override_root: Path | None = None) -> Path | None:
+    """Return the shared database directory for the active app variant."""
+    return _resolve_shared_database_dir(override_root, create=False)
 
 
-def _resolve_shared_database_dir(override_root: Path | None, create: bool) -> Path | None:
+def shared_db_path(override_root: Path | None = None) -> Path | None:
+    """Return the shared database path for the active app variant."""
+    return _resolve_shared_db_path(override_root, create=False)
+
+
+def initialize_client_sync(local_db_path: Path | str | sqlite3.Connection | None = None) -> SharedStatus:
+    """Compatibility helper that reports current shared status for the local cache."""
+    return check_shared_status(local_db_path)
+
+
+def check_shared_status(
+    local_db_path: Path | str | sqlite3.Connection | None = None,
+    override_root: Path | None = None,
+) -> SharedStatus:
+    """Report whether the shared database is reachable for the current local cache."""
+    del local_db_path
+    if not shared_sync_enabled():
+        return SharedStatus(message="Shared sync is disabled for this app.")
+
+    root = _resolve_shared_root(override_root)
+    if root is None:
+        return SharedStatus(enabled=True, message="Shared sync path is not configured.")
+    if not root.exists():
+        return SharedStatus(enabled=True, message=_UNAVAILABLE_MESSAGE)
+
+    shared_path = _resolve_shared_db_path(override_root, create=True)
+    if shared_path is None:
+        return SharedStatus(enabled=True, message="Shared sync paths could not be resolved.")
+
+    try:
+        conn = _shared_connection(shared_path)
+        try:
+            revision = _ensure_numeric_revision(conn, updated_by="status")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            return SharedStatus(enabled=True, shared_available=True, busy=True, message=_BUSY_MESSAGE)
+        return SharedStatus(enabled=True, message=_UNAVAILABLE_MESSAGE)
+    except (OSError, sqlite3.DatabaseError):
+        return SharedStatus(enabled=True, message=_UNAVAILABLE_MESSAGE)
+
+    return SharedStatus(
+        enabled=True,
+        shared_available=True,
+        shared_revision=str(revision),
+        message="Shared sync connected.",
+    )
+
+
+def check_revision(
+    local_db_path: Path | str | sqlite3.Connection | None = None,
+    override_root: Path | None = None,
+) -> RevisionInfo:
+    """Check whether the local cache is behind the shared authoritative revision."""
+    if not shared_sync_enabled():
+        return RevisionInfo(message="Shared sync is disabled for this app.")
+
+    local_path, local_conn, should_close = _resolve_local_target(local_db_path)
+    try:
+        create_tables(local_conn)
+        local_state = load_sync_state(local_conn)
+        local_revision = _parse_revision(local_state.get("revision", ""))
+    finally:
+        if should_close:
+            local_conn.close()
+
+    root = _resolve_shared_root(override_root)
+    if root is None or not root.exists():
+        return RevisionInfo(
+            enabled=True,
+            shared_available=False,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+
+    shared_path = _resolve_shared_db_path(override_root, create=True)
+    if shared_path is None:
+        return RevisionInfo(
+            enabled=True,
+            shared_available=False,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+
+    try:
+        shared_conn = _shared_connection(shared_path)
+        try:
+            shared_revision = _ensure_numeric_revision(shared_conn, updated_by="revision_check")
+        finally:
+            shared_conn.close()
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            return RevisionInfo(
+                enabled=True,
+                shared_available=True,
+                busy=True,
+                local_revision=str(local_revision),
+                message=_BUSY_MESSAGE,
+            )
+        return RevisionInfo(
+            enabled=True,
+            shared_available=False,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+    except (OSError, sqlite3.DatabaseError):
+        return RevisionInfo(
+            enabled=True,
+            shared_available=False,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+
+    return RevisionInfo(
+        enabled=True,
+        shared_available=True,
+        local_revision=str(local_revision),
+        shared_revision=str(shared_revision),
+        needs_sync=shared_revision > local_revision,
+        message="Local snapshot is current." if shared_revision <= local_revision else "Shared data changed.",
+    )
+
+
+def sync_local_from_shared(
+    local_db_path: Path | str | sqlite3.Connection | None = None,
+    override_root: Path | None = None,
+    *,
+    force: bool = False,
+) -> SyncResult:
+    """Refresh the local cache from the shared authoritative database."""
+    if not shared_sync_enabled():
+        return SyncResult(message="Shared sync is disabled for this app.")
+
+    local_path, local_conn, should_close = _resolve_local_target(local_db_path)
+    try:
+        create_tables(local_conn)
+        local_revision = _parse_revision(load_sync_state(local_conn).get("revision", ""))
+    except Exception:
+        local_revision = 0
+
+    root = _resolve_shared_root(override_root)
+    if root is None or not root.exists():
+        if should_close:
+            local_conn.close()
+        return SyncResult(
+            enabled=True,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+
+    shared_path = _resolve_shared_db_path(override_root, create=True)
+    if shared_path is None:
+        if should_close:
+            local_conn.close()
+        return SyncResult(
+            enabled=True,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+
+    try:
+        bootstrap_revision = None
+        if force:
+            bootstrap_revision = _bootstrap_shared_from_local_if_needed(local_conn, shared_path)
+
+        shared_conn = _shared_connection(shared_path)
+        try:
+            shared_revision = _ensure_numeric_revision(shared_conn, updated_by="sync")
+            equipment_rows = fetch_equipment_snapshot(shared_conn)
+            import_issue_rows = fetch_import_issue_snapshot(shared_conn)
+            raw_cell_rows = fetch_raw_cell_snapshot(shared_conn)
+            sync_state = load_sync_state(shared_conn)
+        finally:
+            shared_conn.close()
+
+        if bootstrap_revision is not None:
+            shared_revision = bootstrap_revision
+            sync_state["revision"] = str(shared_revision)
+
+        pulled = len(equipment_rows) + len(import_issue_rows) + len(raw_cell_rows)
+        replace_local_snapshot(
+            local_conn,
+            equipment_rows,
+            import_issue_rows,
+            raw_cell_snapshot=raw_cell_rows,
+            tombstone_snapshot=[],
+            revision=str(shared_revision),
+            equipment_snapshot_hash="",
+            import_issue_snapshot_hash="",
+            global_mutation_at=sync_state.get("global_mutation_at", ""),
+            clear_outbox=True,
+            clear_applied_ops=True,
+            commit=True,
+        )
+        return SyncResult(
+            enabled=True,
+            shared_available=True,
+            pulled=pulled,
+            local_revision=str(shared_revision),
+            shared_revision=str(shared_revision),
+            message="Local snapshot refreshed from shared." if pulled else "Shared sync connected.",
+        )
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            return SyncResult(
+                enabled=True,
+                shared_available=True,
+                busy=True,
+                local_revision=str(local_revision),
+                message=_BUSY_MESSAGE,
+            )
+        return SyncResult(
+            enabled=True,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+    except (OSError, sqlite3.DatabaseError):
+        return SyncResult(
+            enabled=True,
+            local_revision=str(local_revision),
+            message=_UNAVAILABLE_MESSAGE,
+        )
+    finally:
+        if should_close:
+            local_conn.close()
+
+
+def sync_local_with_shared(local_conn, override_root: Path | None = None) -> SyncResult:
+    """Compatibility wrapper used by startup paths and tests."""
+    if local_conn is None:
+        return SyncResult(enabled=True, message="Local database connection is unavailable.")
+    return sync_local_from_shared(local_conn, override_root=override_root, force=False)
+
+
+def create_equipment(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    equipment: Equipment | Mapping[str, Any],
+    override_root: Path | None = None,
+    *,
+    refresh_local: bool = True,
+) -> Equipment:
+    """Create a record in the shared database and refresh the local cache."""
+    eq = _coerce_equipment(equipment)
+
+    def mutate(conn: sqlite3.Connection) -> None:
+        insert_equipment(conn, eq, commit=False)
+
+    _run_shared_mutation(local_db_path, mutate, override_root=override_root, refresh_local=refresh_local)
+    refreshed = _get_local_equipment(local_db_path, eq.record_uuid)
+    if refreshed is None:
+        raise KeyError(f"Record not found after create: {eq.record_uuid}")
+    return refreshed
+
+
+def update_equipment(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    equipment: Equipment | Mapping[str, Any],
+    override_root: Path | None = None,
+    *,
+    refresh_local: bool = True,
+) -> Equipment:
+    """Update a shared record and refresh the local cache."""
+    eq = _coerce_equipment(equipment)
+    record_uuid = (eq.record_uuid or "").strip()
+    if not record_uuid:
+        raise ValueError("record_uuid is required for update.")
+
+    def mutate(conn: sqlite3.Connection) -> None:
+        existing = get_equipment_by_uuid(conn, record_uuid)
+        if existing is None:
+            raise KeyError(f"Unknown record_uuid: {record_uuid}")
+        eq.record_id = existing.record_id
+        update_equipment_local(conn, eq, commit=False)
+
+    _run_shared_mutation(local_db_path, mutate, override_root=override_root, refresh_local=refresh_local)
+    refreshed = _get_local_equipment(local_db_path, record_uuid)
+    if refreshed is None:
+        raise KeyError(f"Record not found after update: {record_uuid}")
+    return refreshed
+
+
+def delete_equipment(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    record_uuid: str,
+    override_root: Path | None = None,
+    *,
+    refresh_local: bool = True,
+) -> None:
+    """Delete a shared record and refresh the local cache."""
+    normalized_uuid = (record_uuid or "").strip()
+    if not normalized_uuid:
+        raise ValueError("record_uuid is required for delete.")
+
+    def mutate(conn: sqlite3.Connection) -> None:
+        existing = get_equipment_by_uuid(conn, normalized_uuid)
+        if existing is None or existing.record_id is None:
+            raise KeyError(f"Unknown record_uuid: {normalized_uuid}")
+        delete_equipment_local(conn, existing.record_id, commit=False)
+
+    _run_shared_mutation(local_db_path, mutate, override_root=override_root, refresh_local=refresh_local)
+
+
+def set_archived(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    record_uuid: str,
+    archived: bool,
+    override_root: Path | None = None,
+    *,
+    refresh_local: bool = True,
+) -> Equipment:
+    """Archive or restore a shared record and refresh the local cache."""
+    normalized_uuid = (record_uuid or "").strip()
+    if not normalized_uuid:
+        raise ValueError("record_uuid is required for archive changes.")
+
+    def mutate(conn: sqlite3.Connection) -> None:
+        existing = get_equipment_by_uuid(conn, normalized_uuid)
+        if existing is None:
+            raise KeyError(f"Unknown record_uuid: {normalized_uuid}")
+        existing.is_archived = bool(archived)
+        update_equipment_local(conn, existing, commit=False)
+
+    _run_shared_mutation(local_db_path, mutate, override_root=override_root, refresh_local=refresh_local)
+    refreshed = _get_local_equipment(local_db_path, normalized_uuid)
+    if refreshed is None:
+        raise KeyError(f"Record not found after archive update: {normalized_uuid}")
+    return refreshed
+
+
+def toggle_verified(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    record_uuid: str,
+    override_root: Path | None = None,
+    *,
+    refresh_local: bool = True,
+) -> Equipment:
+    """Toggle verification in the shared database and refresh the local cache."""
+    normalized_uuid = (record_uuid or "").strip()
+    if not normalized_uuid:
+        raise ValueError("record_uuid is required for verification changes.")
+
+    def mutate(conn: sqlite3.Connection) -> None:
+        existing = get_equipment_by_uuid(conn, normalized_uuid)
+        if existing is None:
+            raise KeyError(f"Unknown record_uuid: {normalized_uuid}")
+        existing.verified_in_survey = not bool(existing.verified_in_survey)
+        update_equipment_local(conn, existing, commit=False)
+
+    _run_shared_mutation(local_db_path, mutate, override_root=override_root, refresh_local=refresh_local)
+    refreshed = _get_local_equipment(local_db_path, normalized_uuid)
+    if refreshed is None:
+        raise KeyError(f"Record not found after verify toggle: {normalized_uuid}")
+    return refreshed
+
+
+def run_excel_import(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    data_dir: Path | str,
+    override_root: Path | None = None,
+    *,
+    mode: str = "merge",
+    refresh_local: bool = True,
+    progress_callback=None,
+) -> dict[str, int]:
+    """Run an Excel import into the shared database and refresh the local cache."""
+    local_path, local_conn, should_close = _resolve_local_target(local_db_path)
+    del local_path
+    shared_path = _require_shared_db_path(override_root)
+
+    try:
+        if mode == "full":
+            stats = run_full_import_to_db(Path(data_dir), shared_path, progress_callback=progress_callback, use_wal=False)
+        else:
+            stats = run_merge_import_to_db(Path(data_dir), shared_path, progress_callback=progress_callback, use_wal=False)
+
+        shared_conn = _shared_connection(shared_path)
+        try:
+            revision = _increment_shared_revision(shared_conn, "excel_import")
+            equipment_rows = fetch_equipment_snapshot(shared_conn)
+            import_issue_rows = fetch_import_issue_snapshot(shared_conn)
+            raw_cell_rows = fetch_raw_cell_snapshot(shared_conn)
+            sync_state = load_sync_state(shared_conn)
+            shared_conn.commit()
+        finally:
+            shared_conn.close()
+
+        if refresh_local:
+            replace_local_snapshot(
+                local_conn,
+                equipment_rows,
+                import_issue_rows,
+                raw_cell_snapshot=raw_cell_rows,
+                tombstone_snapshot=[],
+                revision=str(revision),
+                equipment_snapshot_hash="",
+                import_issue_snapshot_hash="",
+                global_mutation_at=sync_state.get("global_mutation_at", ""),
+                clear_outbox=True,
+                clear_applied_ops=True,
+                commit=True,
+            )
+        return stats
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            raise TimeoutError(_BUSY_MESSAGE) from exc
+        raise ConnectionError(_UNAVAILABLE_MESSAGE) from exc
+    except (OSError, sqlite3.DatabaseError) as exc:
+        raise ConnectionError(_UNAVAILABLE_MESSAGE) from exc
+    finally:
+        if should_close:
+            local_conn.close()
+
+
+def import_database_into_shared(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    source_db_path: Path | str,
+    override_root: Path | None = None,
+    *,
+    refresh_local: bool = True,
+) -> dict[str, int]:
+    """Replace the shared snapshot from a selected DB file and refresh the local cache."""
+    def mutate(conn: sqlite3.Connection) -> dict[str, int]:
+        return import_database_snapshot(conn, Path(source_db_path))
+
+    return _run_shared_import(
+        local_db_path,
+        mutate,
+        override_root=override_root,
+        refresh_local=refresh_local,
+    )
+
+
+def _run_shared_import(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    importer,
+    *,
+    override_root: Path | None,
+    refresh_local: bool,
+) -> dict[str, int]:
+    local_path, local_conn, should_close = _resolve_local_target(local_db_path)
+    del local_path
+    shared_path = _require_shared_db_path(override_root)
+
+    try:
+        shared_conn = _shared_connection(shared_path)
+        try:
+            stats = importer(shared_conn)
+            revision = _increment_shared_revision(shared_conn, "database_import")
+            equipment_rows = fetch_equipment_snapshot(shared_conn)
+            import_issue_rows = fetch_import_issue_snapshot(shared_conn)
+            raw_cell_rows = fetch_raw_cell_snapshot(shared_conn)
+            sync_state = load_sync_state(shared_conn)
+            shared_conn.commit()
+        finally:
+            shared_conn.close()
+
+        if refresh_local:
+            replace_local_snapshot(
+                local_conn,
+                equipment_rows,
+                import_issue_rows,
+                raw_cell_snapshot=raw_cell_rows,
+                tombstone_snapshot=[],
+                revision=str(revision),
+                equipment_snapshot_hash="",
+                import_issue_snapshot_hash="",
+                global_mutation_at=sync_state.get("global_mutation_at", ""),
+                clear_outbox=True,
+                clear_applied_ops=True,
+                commit=True,
+            )
+        return stats
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            raise TimeoutError(_BUSY_MESSAGE) from exc
+        raise ConnectionError(_UNAVAILABLE_MESSAGE) from exc
+    except (OSError, sqlite3.DatabaseError) as exc:
+        raise ConnectionError(_UNAVAILABLE_MESSAGE) from exc
+    finally:
+        if should_close:
+            local_conn.close()
+
+
+def _run_shared_mutation(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    mutate,
+    *,
+    override_root: Path | None,
+    refresh_local: bool,
+) -> None:
+    local_path, local_conn, should_close = _resolve_local_target(local_db_path)
+    del local_path
+    shared_path = _require_shared_db_path(override_root)
+
+    try:
+        shared_conn = _shared_connection(shared_path)
+        try:
+            shared_conn.execute("BEGIN IMMEDIATE")
+            mutate(shared_conn)
+            revision = _increment_shared_revision(shared_conn, APP_CONFIG.display_name)
+            equipment_rows = fetch_equipment_snapshot(shared_conn)
+            import_issue_rows = fetch_import_issue_snapshot(shared_conn)
+            raw_cell_rows = fetch_raw_cell_snapshot(shared_conn)
+            sync_state = load_sync_state(shared_conn)
+            shared_conn.commit()
+        except Exception:
+            if shared_conn.in_transaction:
+                shared_conn.rollback()
+            raise
+        finally:
+            shared_conn.close()
+
+        if refresh_local:
+            replace_local_snapshot(
+                local_conn,
+                equipment_rows,
+                import_issue_rows,
+                raw_cell_snapshot=raw_cell_rows,
+                tombstone_snapshot=[],
+                revision=str(revision),
+                equipment_snapshot_hash="",
+                import_issue_snapshot_hash="",
+                global_mutation_at=sync_state.get("global_mutation_at", ""),
+                clear_outbox=True,
+                clear_applied_ops=True,
+                commit=True,
+            )
+    except sqlite3.OperationalError as exc:
+        if _is_busy_error(exc):
+            raise TimeoutError(_BUSY_MESSAGE) from exc
+        raise ConnectionError(_UNAVAILABLE_MESSAGE) from exc
+    except (OSError, sqlite3.DatabaseError) as exc:
+        raise ConnectionError(_UNAVAILABLE_MESSAGE) from exc
+    finally:
+        if should_close:
+            local_conn.close()
+
+
+def _resolve_local_target(
+    local_db_path: Path | str | sqlite3.Connection | None,
+) -> tuple[Path, sqlite3.Connection, bool]:
+    if isinstance(local_db_path, sqlite3.Connection):
+        create_tables(local_db_path)
+        path = get_database_path(local_db_path)
+        if path is None:
+            raise RuntimeError("Local database path is unavailable.")
+        return path, local_db_path, False
+
+    path = _resolve_local_db_path(local_db_path)
+    conn = get_connection(path)
+    create_tables(conn)
+    return path, conn, True
+
+
+def _resolve_local_db_path(local_db_path: Path | str | None) -> Path:
+    if local_db_path is None:
+        return resolve_db_path()
+    return Path(local_db_path).expanduser().resolve()
+
+
+def _resolve_shared_root(override_root: Path | None) -> Path | None:
     if override_root is not None:
-        path = Path(override_root) / "shared"
+        return Path(override_root).expanduser().resolve()
+    return runtime_shared_root_dir()
+
+
+def _resolve_shared_database_dir(override_root: Path | None, *, create: bool) -> Path | None:
+    if override_root is not None:
+        directory = Path(override_root).expanduser().resolve() / "shared"
         if create:
-            path.mkdir(parents=True, exist_ok=True)
-        return path
-    return shared_database_dir(create=create)
+            directory.mkdir(parents=True, exist_ok=True)
+        return directory
+    return runtime_shared_database_dir(create=create)
 
 
-def _resolve_shared_db_path(override_root: Path | None) -> Path | None:
+def _resolve_shared_db_path(override_root: Path | None, *, create: bool) -> Path | None:
     if override_root is not None:
         filename = getattr(APP_CONFIG, "shared_db_filename", "").strip()
         if not filename:
             return None
-        return Path(override_root) / "shared" / filename
-    return shared_db_path()
+        directory = _resolve_shared_database_dir(override_root, create=create)
+        if directory is None:
+            return None
+        return directory / filename
+    if create:
+        directory = runtime_shared_database_dir(create=True)
+        filename = getattr(APP_CONFIG, "shared_db_filename", "").strip()
+        if directory is None or not filename:
+            return None
+        return directory / filename
+    return runtime_shared_db_path()
 
 
-def _resolve_shared_lock_path(override_root: Path | None) -> Path | None:
-    if override_root is not None:
-        return Path(override_root) / "shared" / "sync.lock"
-    return shared_lock_path()
+def _require_shared_db_path(override_root: Path | None) -> Path:
+    root = _resolve_shared_root(override_root)
+    if root is None or not root.exists():
+        raise ConnectionError(_UNAVAILABLE_MESSAGE)
+    shared_path = _resolve_shared_db_path(override_root, create=True)
+    if shared_path is None:
+        raise ConnectionError(_UNAVAILABLE_MESSAGE)
+    return shared_path
 
 
-def _resolve_shared_backup_dir(override_root: Path | None, create: bool) -> Path | None:
-    if override_root is not None:
-        path = Path(override_root) / "backups"
-        if create:
-            path.mkdir(parents=True, exist_ok=True)
-        return path
-    return shared_backup_dir(create=create)
+def _shared_connection(shared_path: Path) -> sqlite3.Connection:
+    conn = get_connection(shared_path, use_wal=False)
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout = 2000")
+    create_tables(conn)
+    return conn
 
 
-def _resolve_release_manifest_path(override_root: Path | None) -> Path | None:
-    if override_root is not None:
-        filename = getattr(APP_CONFIG, "release_manifest_filename", "current.json").strip() or "current.json"
-        return Path(override_root) / filename
-    return shared_release_manifest_path()
-
-
-def _equipment_count(conn) -> int:
-    return conn.execute("SELECT COUNT(*) FROM equipment").fetchone()[0]
-
-
-def _rebuild_local_sync_state(conn) -> None:
-    conn.execute("DELETE FROM record_sync_state")
-    rows = get_all_equipment(conn, archived="all")
-    for eq in rows:
-        if not eq.record_uuid:
-            continue
-        _set_record_sync_state(conn, eq.record_uuid, _equipment_sync_hash(eq))
-    conn.execute("UPDATE sync_conflicts SET resolved=1 WHERE resolved=0")
-    conn.commit()
-
-
-def _dedupe_exact_equipment_rows(conn) -> bool:
-    """Collapse rows that are identical except for UUID/timestamps."""
-    rows = [eq for eq in get_all_equipment(conn, archived="all") if eq.record_uuid]
-    groups: dict[str, list[Equipment]] = {}
-    for eq in rows:
-        groups.setdefault(_equipment_sync_hash(eq), []).append(eq)
-
-    changed = False
-    for sync_hash, grouped_rows in groups.items():
-        if len(grouped_rows) <= 1:
-            continue
-
-        canonical = min(grouped_rows, key=_canonical_equipment_identity)
-        duplicates = [eq for eq in grouped_rows if eq.record_uuid != canonical.record_uuid]
-        if not duplicates:
-            continue
-
-        changed = True
-        for duplicate in duplicates:
-            _clear_record_sync_state(conn, duplicate.record_uuid)
-            _resolve_conflict(conn, duplicate.record_uuid)
-            _delete_equipment_by_uuid(conn, duplicate.record_uuid)
-
-        _clear_record_sync_state(conn, canonical.record_uuid)
-        _set_record_sync_state(conn, canonical.record_uuid, sync_hash)
-        _resolve_conflict(conn, canonical.record_uuid)
-
-    if changed:
-        conn.commit()
-    return changed
-
-
-def _align_local_records_to_shared(local_conn, shared_conn) -> None:
-    """Match pre-sync local rows to shared rows before UUID-based merge logic."""
-    local_rows = [eq for eq in get_all_equipment(local_conn, archived="all") if eq.record_uuid]
-    shared_rows = [eq for eq in get_all_equipment(shared_conn, archived="all") if eq.record_uuid]
-    if not local_rows or not shared_rows:
-        return
-
-    shared_by_uuid = {eq.record_uuid: eq for eq in shared_rows if eq.record_uuid}
-    shared_by_hash: dict[str, list[Equipment]] = {}
-    for eq in shared_rows:
-        shared_by_hash.setdefault(_equipment_sync_hash(eq), []).append(eq)
-
-    by_asset, by_serial, by_import_key = build_equipment_indexes(shared_rows)
-    local_uuids = {eq.record_uuid for eq in local_rows if eq.record_uuid}
-    changed = False
-
-    for eq in local_rows:
-        if not eq.record_uuid or eq.record_uuid in shared_by_uuid:
-            continue
-
-        shared_match = _resolve_shared_match(eq, shared_by_hash, by_asset, by_serial, by_import_key)
-        if shared_match is None or not shared_match.record_uuid:
-            continue
-        if shared_match.record_uuid in local_uuids:
-            continue
-
-        changed = True
-        old_uuid = eq.record_uuid
-        local_hash = _equipment_sync_hash(eq)
-        shared_hash = _equipment_sync_hash(shared_match)
-
-        local_conn.execute(
-            "UPDATE equipment SET record_uuid=? WHERE record_uuid=?",
-            (shared_match.record_uuid, old_uuid),
-        )
-        _clear_record_sync_state(local_conn, old_uuid)
-        local_conn.execute("DELETE FROM sync_conflicts WHERE record_uuid=?", (old_uuid,))
-
-        if local_hash == shared_hash:
-            _set_record_sync_state(local_conn, shared_match.record_uuid, local_hash)
-            _resolve_conflict(local_conn, shared_match.record_uuid)
-        else:
-            baseline_hash = _baseline_hash_for_aligned_match(eq, shared_match, local_hash, shared_hash)
-            if baseline_hash:
-                _set_record_sync_state(local_conn, shared_match.record_uuid, baseline_hash)
-            else:
-                _clear_record_sync_state(local_conn, shared_match.record_uuid)
-
-        local_uuids.discard(old_uuid)
-        local_uuids.add(shared_match.record_uuid)
-
-    if changed:
-        local_conn.commit()
-
-
-def _resolve_shared_match(
-    eq: Equipment,
-    shared_by_hash: dict[str, list[Equipment]],
-    by_asset: dict[str, list[Equipment]],
-    by_serial: dict[str, list[Equipment]],
-    by_import_key: dict[str, list[Equipment]],
-) -> Equipment | None:
-    """Find the single shared row that should represent this local record."""
-    exact_matches = shared_by_hash.get(_equipment_sync_hash(eq), [])
-    if len(exact_matches) == 1:
-        return exact_matches[0]
-    if len(exact_matches) > 1:
+def _bootstrap_shared_from_local_if_needed(local_conn: sqlite3.Connection, shared_path: Path) -> int | None:
+    local_rows = get_all_equipment(local_conn, archived="all")
+    if not local_rows:
         return None
 
-    match = resolve_equipment_match(
-        by_asset,
-        by_serial,
-        by_import_key,
-        asset_number=eq.asset_number,
-        serial_number=eq.serial_number,
-        import_key=eq.primary_import_key(),
-    )
-    if match.status != "matched":
-        return None
-    return match.record
-
-
-def _baseline_hash_for_aligned_match(
-    local_eq: Equipment,
-    shared_eq: Equipment,
-    local_hash: str,
-    shared_hash: str,
-) -> str:
-    """Infer which side represents the last common baseline for an aligned pair."""
-    local_updated = _normalized_updated_at(local_eq)
-    shared_updated = _normalized_updated_at(shared_eq)
-    if local_updated > shared_updated:
-        return shared_hash
-    if shared_updated > local_updated:
-        return local_hash
-    return ""
-
-
-def _normalized_updated_at(eq: Equipment) -> str:
-    """Return a sortable timestamp fallback for sync comparison."""
-    return (eq.updated_at or eq.created_at or "").strip()
-
-
-def _canonical_equipment_identity(eq: Equipment) -> tuple[str, str, int]:
-    """Return a deterministic sort key used when collapsing exact duplicates."""
-    record_uuid = (eq.record_uuid or "").strip()
-    created_at = (eq.created_at or "").strip()
-    record_id = int(eq.record_id or 0)
-    return record_uuid, created_at, record_id
-
-
-def _load_record_sync_state(conn) -> dict[str, str]:
-    rows = conn.execute("SELECT record_uuid, last_synced_hash FROM record_sync_state").fetchall()
-    return {
-        (row["record_uuid"] if hasattr(row, "keys") else row[0]): (row["last_synced_hash"] if hasattr(row, "keys") else row[1])
-        for row in rows
-    }
-
-
-def _set_record_sync_state(conn, record_uuid: str, sync_hash: str) -> None:
-    conn.execute(
-        """
-        INSERT INTO record_sync_state (record_uuid, last_synced_hash, synced_at)
-        VALUES (?, ?, datetime('now'))
-        ON CONFLICT(record_uuid) DO UPDATE SET
-            last_synced_hash=excluded.last_synced_hash,
-            synced_at=datetime('now')
-        """,
-        (record_uuid, sync_hash),
-    )
-
-
-def _clear_record_sync_state(conn, record_uuid: str) -> None:
-    conn.execute("DELETE FROM record_sync_state WHERE record_uuid=?", (record_uuid,))
-
-
-def _record_conflict(conn, record_uuid: str, local_hash: str, shared_hash: str, last_synced_hash: str) -> None:
-    summary = f"Both local and shared versions changed for record {record_uuid}."
-    existing = conn.execute(
-        """
-        SELECT id
-        FROM sync_conflicts
-        WHERE record_uuid=? AND local_hash=? AND shared_hash=? AND last_synced_hash=? AND resolved=0
-        """,
-        (record_uuid, local_hash, shared_hash, last_synced_hash),
-    ).fetchone()
-    if existing is not None:
-        return
-    conn.execute(
-        """
-        INSERT INTO sync_conflicts (record_uuid, local_hash, shared_hash, last_synced_hash, summary)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (record_uuid, local_hash, shared_hash, last_synced_hash, summary),
-    )
-
-
-def _resolve_conflict(conn, record_uuid: str) -> None:
-    conn.execute(
-        "UPDATE sync_conflicts SET resolved=1 WHERE record_uuid=? AND resolved=0",
-        (record_uuid,),
-    )
-
-
-def _equipment_sync_hash(eq: Equipment | None) -> str:
-    if eq is None:
-        return ""
-    payload = {
-        field: getattr(eq, field)
-        for field in _SYNC_HASH_FIELDS
-    }
-    raw = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _upsert_equipment_by_uuid(conn, eq: Equipment | None) -> None:
-    if eq is None:
-        return
-
-    conn.execute(
-        """
-        INSERT INTO equipment (
-            record_uuid, asset_number, serial_number, manufacturer, manufacturer_raw,
-            model, description, qty,
-            location, assigned_to, ownership_type, rental_vendor, rental_cost_monthly,
-            calibration_status, last_calibration_date, calibration_due_date,
-            calibration_vendor, calibration_cost,
-            lifecycle_status, working_status, condition,
-            acquired_date, estimated_age_years, age_basis,
-            verified_in_survey, blue_dot_ref,
-            project_name, picture_path, links, notes, manual_entry, is_archived, source_refs,
-            created_at, updated_at
-        ) VALUES (
-            ?, ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, ?,
-            ?, ?, ?,
-            ?, ?, ?,
-            ?, ?,
-            ?, ?, ?, ?, ?, ?, ?,
-            ?, ?
-        )
-        ON CONFLICT(record_uuid) DO UPDATE SET
-            asset_number=excluded.asset_number,
-            serial_number=excluded.serial_number,
-            manufacturer=excluded.manufacturer,
-            manufacturer_raw=excluded.manufacturer_raw,
-            model=excluded.model,
-            description=excluded.description,
-            qty=excluded.qty,
-            location=excluded.location,
-            assigned_to=excluded.assigned_to,
-            ownership_type=excluded.ownership_type,
-            rental_vendor=excluded.rental_vendor,
-            rental_cost_monthly=excluded.rental_cost_monthly,
-            calibration_status=excluded.calibration_status,
-            last_calibration_date=excluded.last_calibration_date,
-            calibration_due_date=excluded.calibration_due_date,
-            calibration_vendor=excluded.calibration_vendor,
-            calibration_cost=excluded.calibration_cost,
-            lifecycle_status=excluded.lifecycle_status,
-            working_status=excluded.working_status,
-            condition=excluded.condition,
-            acquired_date=excluded.acquired_date,
-            estimated_age_years=excluded.estimated_age_years,
-            age_basis=excluded.age_basis,
-            verified_in_survey=excluded.verified_in_survey,
-            blue_dot_ref=excluded.blue_dot_ref,
-            project_name=excluded.project_name,
-            picture_path=excluded.picture_path,
-            links=excluded.links,
-            notes=excluded.notes,
-            manual_entry=excluded.manual_entry,
-            is_archived=excluded.is_archived,
-            source_refs=excluded.source_refs,
-            created_at=excluded.created_at,
-            updated_at=excluded.updated_at
-        """,
-        (
-            eq.record_uuid,
-            eq.asset_number,
-            eq.serial_number,
-            eq.manufacturer,
-            eq.manufacturer_raw,
-            eq.model,
-            eq.description,
-            eq.qty,
-            eq.location,
-            eq.assigned_to,
-            eq.ownership_type,
-            eq.rental_vendor,
-            eq.rental_cost_monthly,
-            eq.calibration_status,
-            eq.last_calibration_date,
-            eq.calibration_due_date,
-            eq.calibration_vendor,
-            eq.calibration_cost,
-            eq.lifecycle_status,
-            eq.working_status,
-            eq.condition,
-            eq.acquired_date,
-            eq.estimated_age_years,
-            eq.age_basis,
-            1 if eq.verified_in_survey else 0,
-            eq.blue_dot_ref,
-            eq.project_name,
-            eq.picture_path,
-            eq.links,
-            eq.notes,
-            1 if eq.manual_entry else 0,
-            1 if eq.is_archived else 0,
-            eq.source_refs,
-            eq.created_at,
-            eq.updated_at,
-        ),
-    )
-    row = conn.execute(
-        "SELECT record_id FROM equipment WHERE record_uuid=?",
-        (eq.record_uuid,),
-    ).fetchone()
-    if row is None:
-        return
-    record_id = row["record_id"] if hasattr(row, "keys") else row[0]
-    conn.execute("DELETE FROM equipment_search WHERE record_id=?", (record_id,))
-    conn.execute(
-        "INSERT INTO equipment_search (record_id, search_text) VALUES (?, ?)",
-        (record_id, _build_equipment_search_text(eq)),
-    )
-
-
-def _delete_equipment_by_uuid(conn, record_uuid: str) -> None:
-    row = conn.execute(
-        "SELECT record_id FROM equipment WHERE record_uuid=?",
-        (record_uuid,),
-    ).fetchone()
-    if row is None:
-        return
-    record_id = row["record_id"] if hasattr(row, "keys") else row[0]
-    conn.execute("DELETE FROM equipment WHERE record_uuid=?", (record_uuid,))
-    conn.execute("DELETE FROM equipment_search WHERE record_id=?", (record_id,))
-
-
-def _backup_shared_db(shared_path: Path, backups_dir: Path) -> None:
-    if not shared_path.exists():
-        return
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"{shared_path.stem}_{timestamp}{shared_path.suffix}"
-    shutil.copy2(shared_path, backups_dir / backup_name)
-
-
-def _compare_versions(left: str, right: str) -> int:
-    left_parts = _version_parts(left)
-    right_parts = _version_parts(right)
-    width = max(len(left_parts), len(right_parts))
-    padded_left = left_parts + (0,) * (width - len(left_parts))
-    padded_right = right_parts + (0,) * (width - len(right_parts))
-    if padded_left == padded_right:
-        return 0
-    return 1 if padded_left > padded_right else -1
-
-
-def _version_parts(value: str) -> tuple[int, ...]:
-    parts = []
-    for token in value.split("."):
-        digits = "".join(ch for ch in token if ch.isdigit())
-        parts.append(int(digits or 0))
-    return tuple(parts)
-
-
-@contextmanager
-def _shared_lock(lock_path: Path):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "time": datetime.now().isoformat(timespec="seconds"),
-    }
-
-    while True:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError as exc:
-            try:
-                age = datetime.now().timestamp() - lock_path.stat().st_mtime
-            except OSError:
-                raise TimeoutError("Shared sync lock is busy.") from exc
-            if age > _LOCK_STALE_SECONDS:
-                try:
-                    lock_path.unlink()
-                    continue
-                except OSError as unlink_exc:
-                    raise TimeoutError("Shared sync lock is busy.") from unlink_exc
-            raise TimeoutError("Shared sync lock is busy.") from exc
-
+    shared_conn = _shared_connection(shared_path)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        yield
+        current_revision = _parse_revision(load_sync_state(shared_conn).get("revision", ""))
+        shared_rows = get_all_equipment(shared_conn, archived="all")
+        if current_revision > 0 or shared_rows:
+            return None
+
+        equipment_snapshot = fetch_equipment_snapshot(local_conn)
+        import_issue_snapshot = fetch_import_issue_snapshot(local_conn)
+        raw_cell_snapshot = fetch_raw_cell_snapshot(local_conn)
+
+        replace_local_snapshot(
+            shared_conn,
+            equipment_snapshot,
+            import_issue_snapshot,
+            raw_cell_snapshot=raw_cell_snapshot,
+            tombstone_snapshot=[],
+            revision="1",
+            equipment_snapshot_hash="",
+            import_issue_snapshot_hash="",
+            global_mutation_at="",
+            clear_outbox=True,
+            clear_applied_ops=True,
+            commit=True,
+        )
+        _set_numeric_revision(shared_conn, 1, "bootstrap", commit=True)
+        return 1
     finally:
-        try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        shared_conn.close()
+
+
+def _ensure_numeric_revision(conn: sqlite3.Connection, updated_by: str) -> int:
+    state = load_sync_state(conn)
+    revision = _parse_revision(state.get("revision", ""))
+    if str(state.get("revision", "")).strip().isdigit():
+        return revision
+
+    row = conn.execute("SELECT COUNT(*) FROM equipment").fetchone()
+    record_count = int(row[0] if row is not None else 0)
+    normalized_revision = 1 if record_count > 0 else 0
+    _set_numeric_revision(conn, normalized_revision, updated_by, commit=True)
+    return normalized_revision
+
+
+def _increment_shared_revision(conn: sqlite3.Connection, updated_by: str) -> int:
+    current_revision = _ensure_numeric_revision(conn, updated_by)
+    next_revision = current_revision + 1
+    _set_numeric_revision(conn, next_revision, updated_by, commit=False)
+    return next_revision
+
+
+def _set_numeric_revision(conn: sqlite3.Connection, revision: int, updated_by: str, *, commit: bool) -> None:
+    set_sync_state(
+        conn,
+        revision=str(max(int(revision), 0)),
+        equipment_snapshot_hash="",
+        import_issue_snapshot_hash="",
+        global_mutation_at="",
+        commit=commit,
+    )
+
+
+def _parse_revision(value: Any) -> int:
+    try:
+        return max(int(str(value or "").strip()), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_equipment(equipment: Equipment | Mapping[str, Any]) -> Equipment:
+    if isinstance(equipment, Equipment):
+        return equipment
+
+    eq = Equipment()
+    for field_name, value in dict(equipment).items():
+        if hasattr(eq, field_name):
+            setattr(eq, field_name, value)
+    return eq
+
+
+def _get_local_equipment(
+    local_db_path: Path | str | sqlite3.Connection | None,
+    record_uuid: str,
+) -> Equipment | None:
+    _, conn, should_close = _resolve_local_target(local_db_path)
+    try:
+        return get_equipment_by_uuid(conn, record_uuid)
+    finally:
+        if should_close:
+            conn.close()
+
+
+def _is_busy_error(exc: BaseException) -> bool:
+    return "locked" in str(exc).lower() or "busy" in str(exc).lower()

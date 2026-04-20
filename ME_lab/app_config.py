@@ -12,7 +12,6 @@ class AppConfig:
     app_dir_name: str
     display_name: str
     application_name: str
-    creator_name: str = ""
     company_name: str
     product_name: str
     file_description: str
@@ -43,6 +42,7 @@ class AppConfig:
     auto_sync_interval_ms: int
     enable_shared_sync: bool
     enable_update_checks: bool
+    creator_name: str = ""
 
 
 APP_CONFIG = AppConfig(

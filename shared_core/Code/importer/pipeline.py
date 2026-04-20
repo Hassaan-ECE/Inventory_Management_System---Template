@@ -17,14 +17,22 @@ from Code.importer.normalizer import is_placeholder
 from Code.importer.survey_parser import SURVEY_FILE, index_survey_raw_cells, parse_survey
 
 
-def run_full_import(data_dir: Path, db_path: Path | None = None,
-                    progress_callback=None) -> dict:
+def run_full_import(
+    data_dir: Path,
+    db_path: Path | None = None,
+    progress_callback=None,
+    *,
+    target_db_path: Path | str | None = None,
+    use_wal: bool = True,
+) -> dict:
     """Run the complete import pipeline.
 
     Args:
         data_dir: Path to the Data/ folder containing the Excel files.
-        db_path: Optional path for the SQLite database. Uses default if None.
+        db_path: Optional legacy path for the SQLite database. Uses default if None.
         progress_callback: Optional callable(step_name, detail) for progress updates.
+        target_db_path: Optional explicit target DB path. Preferred for sync/shared imports.
+        use_wal: Whether to open the target DB in WAL mode.
 
     Returns a dict with import statistics.
     """
@@ -33,7 +41,10 @@ def run_full_import(data_dir: Path, db_path: Path | None = None,
     if not master_path.exists():
         raise FileNotFoundError(f"Master workbook not found: {master_path}")
 
-    conn = get_connection(db_path)
+    conn = get_connection(
+        _resolve_target_db_path(db_path=db_path, target_db_path=target_db_path),
+        use_wal=use_wal,
+    )
 
     stats = {
         "base_records": 0,
@@ -144,8 +155,14 @@ def run_full_import(data_dir: Path, db_path: Path | None = None,
         conn.close()
 
 
-def run_merge_import(data_dir: Path, db_path: Path | None = None,
-                     progress_callback=None) -> dict:
+def run_merge_import(
+    data_dir: Path,
+    db_path: Path | None = None,
+    progress_callback=None,
+    *,
+    target_db_path: Path | str | None = None,
+    use_wal: bool = True,
+) -> dict:
     """Parse the current Excel files and merge them into the existing database."""
     master_path = data_dir / MASTER_FILE
     if not master_path.exists():
@@ -156,7 +173,10 @@ def run_merge_import(data_dir: Path, db_path: Path | None = None,
         survey_path = data_dir / SURVEY_FILE
         if not survey_path.exists():
             raise FileNotFoundError(f"Survey workbook not found: {survey_path}")
-    conn = get_connection(db_path)
+    conn = get_connection(
+        _resolve_target_db_path(db_path=db_path, target_db_path=target_db_path),
+        use_wal=use_wal,
+    )
 
     stats = {
         "parsed_records": 0,
@@ -295,6 +315,38 @@ def run_merge_import(data_dir: Path, db_path: Path | None = None,
         conn.close()
 
 
+def run_full_import_to_db(
+    data_dir: Path,
+    target_db_path: Path | str,
+    progress_callback=None,
+    *,
+    use_wal: bool = False,
+) -> dict:
+    """Run a full import into an explicitly provided database path."""
+    return run_full_import(
+        data_dir,
+        progress_callback=progress_callback,
+        target_db_path=target_db_path,
+        use_wal=use_wal,
+    )
+
+
+def run_merge_import_to_db(
+    data_dir: Path,
+    target_db_path: Path | str,
+    progress_callback=None,
+    *,
+    use_wal: bool = False,
+) -> dict:
+    """Run a merge import into an explicitly provided database path."""
+    return run_merge_import(
+        data_dir,
+        progress_callback=progress_callback,
+        target_db_path=target_db_path,
+        use_wal=use_wal,
+    )
+
+
 def _match_survey(base_records: list[Equipment],
                   survey_rows: list[dict],
                   issues: list[ImportIssue],
@@ -380,6 +432,26 @@ def _emit(callback, step: str, detail: str) -> None:
     """Emit a progress update if callback is provided."""
     if callback:
         callback(step, detail)
+
+
+def _resolve_target_db_path(
+    db_path: Path | str | None,
+    target_db_path: Path | str | None,
+) -> Path | None:
+    """Resolve a single target DB path from legacy and explicit parameters."""
+    explicit = Path(target_db_path).expanduser() if target_db_path is not None else None
+    legacy = Path(db_path).expanduser() if db_path is not None else None
+
+    if explicit is None:
+        return legacy
+    if legacy is None:
+        return explicit
+
+    if explicit.resolve(strict=False) != legacy.resolve(strict=False):
+        raise ValueError(
+            "Conflicting DB targets provided. Use either db_path or target_db_path, not both."
+        )
+    return explicit
 
 
 def _detect_duplicate_field(

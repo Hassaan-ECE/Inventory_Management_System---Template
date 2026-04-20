@@ -119,14 +119,6 @@ def shared_db_path() -> Path | None:
     return directory / SHARED_DB_FILENAME
 
 
-def shared_lock_path() -> Path | None:
-    """Return the lock-file path used to serialize shared sync operations."""
-    directory = shared_database_dir(create=False)
-    if directory is None:
-        return None
-    return directory / "sync.lock"
-
-
 def shared_backup_dir(create: bool = False) -> Path | None:
     """Return the shared backup directory below the network root."""
     root = shared_root_dir()

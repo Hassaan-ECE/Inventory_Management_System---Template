@@ -1,12 +1,13 @@
-"""Starter smoke test for the ME inventory app."""
+"""Starter smoke tests for the ME inventory app and shared-first sync scheduling."""
 
+from contextlib import ExitStack
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from PySide6.QtCore import QPoint, QEvent
-from PySide6.QtWidgets import QApplication, QHeaderView, QMessageBox
+from PySide6.QtWidgets import QApplication, QHeaderView, QMessageBox, QPushButton
 
 from Code.db.database import create_tables, get_connection, insert_equipment
 from Code.db.models import Equipment
@@ -25,13 +26,30 @@ class MainWindowSmokeTests(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "test.db"
         self.conn = get_connection(self.db_path)
         create_tables(self.conn)
+        self._window_stacks: list[ExitStack] = []
 
     def tearDown(self) -> None:
+        while self._window_stacks:
+            self._window_stacks.pop().close()
         self.conn.close()
         self.temp_dir.cleanup()
 
-    def test_window_can_be_created_against_empty_database(self) -> None:
+    def _make_window(self) -> MainWindow:
+        stack = ExitStack()
+        stack.enter_context(patch("Code.gui.main_window.shared_sync_enabled", return_value=False))
+        stack.enter_context(patch("Code.gui.main_window.update_checks_enabled", return_value=False))
         window = MainWindow(self.conn)
+        self._window_stacks.append(stack)
+        return window
+
+    def _find_button(self, window: MainWindow, label_prefix: str) -> QPushButton | None:
+        for button in window.findChildren(QPushButton):
+            if button.text().strip().startswith(label_prefix):
+                return button
+        return None
+
+    def test_window_can_be_created_against_empty_database(self) -> None:
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -84,7 +102,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             ),
         )
 
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -121,7 +139,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             ),
         )
 
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -146,33 +164,34 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_close_flushes_pending_shared_sync(self) -> None:
-        window = MainWindow(self.conn)
+    def test_close_does_not_force_queue_flush_in_shared_first_mode(self) -> None:
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
             self.app.processEvents()
 
+            window._pending_sync_timer.setInterval(30000)
             window._pending_sync_timer.start()
             with patch.object(window, "_run_shared_sync") as run_sync:
                 window.close()
                 self.app.processEvents()
 
-            run_sync.assert_called_once_with(quiet=True)
+            run_sync.assert_not_called()
         finally:
             window.close()
 
-    def test_activation_change_schedules_foreground_sync(self) -> None:
-        window = MainWindow(self.conn)
+    def test_activation_change_schedules_foreground_authoritative_sync(self) -> None:
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
             self.app.processEvents()
 
             window._foreground_sync_timer.setInterval(0)
-            with patch.object(window, "isActiveWindow", return_value=True), patch.object(
-                window, "_run_shared_sync"
-            ) as run_sync:
+            with patch("Code.gui.main_window.shared_sync_enabled", new=lambda: True), patch.object(
+                window, "isActiveWindow", return_value=True
+            ), patch.object(window, "_run_shared_sync") as run_sync:
                 window.changeEvent(QEvent(QEvent.ActivationChange))
                 self.app.processEvents()
 
@@ -180,17 +199,17 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
-    def test_shared_db_change_schedules_near_immediate_sync(self) -> None:
-        window = MainWindow(self.conn)
+    def test_shared_db_change_schedules_near_immediate_authoritative_sync(self) -> None:
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
             self.app.processEvents()
 
             window._shared_change_sync_timer.setInterval(0)
-            with patch.object(window, "_refresh_shared_watch_paths"), patch.object(
-                window, "_run_shared_sync"
-            ) as run_sync:
+            with patch("Code.gui.main_window.shared_sync_enabled", new=lambda: True), patch.object(
+                window, "_refresh_shared_watch_paths"
+            ), patch.object(window, "_run_shared_sync") as run_sync:
                 window._on_shared_path_changed("S:/shared/me_lab_shared.db")
                 self.app.processEvents()
 
@@ -198,8 +217,58 @@ class MainWindowSmokeTests(unittest.TestCase):
         finally:
             window.close()
 
+    def test_background_shared_sync_loss_does_not_show_modal_popup(self) -> None:
+        window = self._make_window()
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            with patch("Code.gui.main_window.QMessageBox.warning") as warning:
+                window._on_sync_completed(
+                    {"shared_available": False, "busy": False, "queued": 0, "pulled": 0, "flushed": 0, "superseded": 0}
+                )
+                self.app.processEvents()
+
+            warning.assert_not_called()
+            self.assertTrue(window._reconnect_timer.isActive())
+        finally:
+            window.close()
+
+    def test_disconnected_state_disables_edit_and_import_actions(self) -> None:
+        window = self._make_window()
+        try:
+            window.resize(1100, 700)
+            window.show()
+            self.app.processEvents()
+
+            import_button = self._find_button(window, "Import Data")
+            add_button = self._find_button(window, "+ Add")
+            self.assertIsNotNone(import_button)
+            self.assertIsNotNone(add_button)
+            assert import_button is not None
+            assert add_button is not None
+
+            with patch("Code.gui.main_window.shared_sync_enabled", new=lambda: True):
+                window._on_sync_completed({"shared_available": True, "busy": False, "queued": 0, "pulled": 0, "flushed": 0, "superseded": 0})
+                self.app.processEvents()
+                self.assertTrue(import_button.isEnabled())
+                self.assertTrue(add_button.isEnabled())
+
+                window._on_sync_completed({"shared_available": False, "busy": False, "queued": 0, "pulled": 0, "flushed": 0, "superseded": 0})
+                self.app.processEvents()
+                self.assertFalse(import_button.isEnabled())
+                self.assertFalse(add_button.isEnabled())
+
+            window._on_sync_completed({"shared_available": True, "busy": False, "queued": 0, "pulled": 0, "flushed": 0, "superseded": 0})
+            self.app.processEvents()
+            self.assertTrue(import_button.isEnabled())
+            self.assertTrue(add_button.isEnabled())
+        finally:
+            window.close()
+
     def test_accepting_available_update_launches_installer_and_closes_app(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -228,7 +297,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_qty_starts_at_minimum_width_and_other_me_columns_start_evenly(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -251,7 +320,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_description_column_keeps_interactive_resize_handle(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             headers = [
                 window.table.horizontalHeaderItem(index).text()
@@ -266,7 +335,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_last_visible_column_stretches_to_fill_table_width(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -289,7 +358,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_location_becomes_last_visible_column_when_links_is_hidden(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -316,7 +385,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_non_last_column_resize_is_clamped_and_uses_title_based_minimum(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -360,7 +429,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_short_header_columns_can_use_smaller_minimum_widths(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -383,7 +452,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_hidden_asset_column_moves_out_of_the_left_edge(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -404,7 +473,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_verified_column_can_be_hidden(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -425,7 +494,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_last_data_column_stays_visible_even_if_verified_is_shown(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -457,7 +526,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             window.close()
 
     def test_last_visible_column_keeps_minimum_width(self) -> None:
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -497,7 +566,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             ),
         )
 
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -541,7 +610,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             ),
         )
 
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
@@ -582,7 +651,7 @@ class MainWindowSmokeTests(unittest.TestCase):
             ),
         )
 
-        window = MainWindow(self.conn)
+        window = self._make_window()
         try:
             window.resize(1100, 700)
             window.show()
