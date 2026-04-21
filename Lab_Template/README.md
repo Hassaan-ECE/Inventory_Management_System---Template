@@ -1,25 +1,44 @@
 # Lab Template
 
-Starter app folder for a new inventory variant that reuses `shared_core`.
+`Lab_Template` is the thin app wrapper around `shared_core`.
 
-## Copy Workflow
+Use it as the starting point for a new inventory variant while keeping shared runtime behavior in `shared_core/Code`.
 
-1. Copy `Lab_Template` to a new app folder such as `ME_Lab`.
-2. Update `app_config.py` with the new app name, env var, file names, and export names.
-3. Add the expected source files into `Data/`.
+## What Lives Here
+
+- `main.py` - application entrypoint (`main()`)
+- `app_config.py` - variant metadata and behavior flags
+- `build.py` - optional packaging/build helper
+- `requirements.txt` - runtime dependencies only
+- `tests/` - smoke + characterization tests for template behavior
+
+## Create a New Variant
+
+1. Copy `Lab_Template` to your target variant folder.
+2. Update `app_config.py` values (names, filenames, shared-sync options).
+3. Add source files to `Data/` based on your import profile.
 4. Run `python main.py`.
 
-## Included
+## Development Commands
 
-- `main.py` for launching the desktop app
-- `app_config.py` for app-specific naming and file configuration
-- `build.py` for optional Nuitka `.exe` builds
-- `requirements.txt` for runtime dependencies
-- `tests/` as a small starter test scaffold
-- `Data/` as the place for source files and the local SQLite database
+From `Lab_Template/`:
 
-## Notes
+```bash
+pip install -r requirements.txt
+pip install -r ..\requirements-dev.txt
+python -m pytest tests -q
+python main.py
+python build.py
+```
 
-- The shared runtime logic lives in `../shared_core/Code/`.
-- The app can still open with an empty database if the source files are not present yet.
-- Rename the placeholder source file names in `app_config.py` before the first real import.
+## First-Run Import Behavior
+
+- If expected source files are present, first launch runs an import.
+- If files are missing, the app still starts against an empty DB and shows guidance.
+- You can run imports later from the app UI.
+
+## Customization Safety Rules
+
+- Keep business/runtime logic changes in `shared_core/Code`.
+- Keep variant-specific naming, paths, and flags in `app_config.py`.
+- Do not rename existing `AppConfig` keys if backward compatibility is required.

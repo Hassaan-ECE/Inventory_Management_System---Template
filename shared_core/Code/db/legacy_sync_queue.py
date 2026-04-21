@@ -1,0 +1,65 @@
+"""Legacy queue/tombstone compatibility APIs retained for older callers.
+
+The shared-first runtime no longer relies on these primitives for normal operation,
+but they remain callable for backward compatibility and data migration workflows.
+"""
+
+from __future__ import annotations
+
+from Code.db._database_impl import (
+    count_pending_outbox_operations,
+    delete_applied_op,
+    delete_equipment_tombstone,
+    delete_outbox_op,
+    enqueue_outbox_op,
+    enqueue_outbox_operation,
+    get_applied_op,
+    get_applied_operation,
+    get_equipment_tombstone,
+    get_outbox_op,
+    get_outbox_operation,
+    get_tombstone,
+    has_applied_op,
+    list_applied_ops,
+    list_equipment_tombstones,
+    list_outbox_operations,
+    list_outbox_ops,
+    mark_outbox_operation_applied,
+    mark_outbox_operation_pending,
+    mark_outbox_operation_superseded,
+    record_applied_op,
+    record_applied_operation,
+    upsert_equipment_tombstone,
+    upsert_tombstone,
+    update_outbox_op,
+    update_outbox_operation_status,
+)
+
+__all__ = [
+    "count_pending_outbox_operations",
+    "delete_applied_op",
+    "delete_equipment_tombstone",
+    "delete_outbox_op",
+    "enqueue_outbox_op",
+    "enqueue_outbox_operation",
+    "get_applied_op",
+    "get_applied_operation",
+    "get_equipment_tombstone",
+    "get_outbox_op",
+    "get_outbox_operation",
+    "get_tombstone",
+    "has_applied_op",
+    "list_applied_ops",
+    "list_equipment_tombstones",
+    "list_outbox_operations",
+    "list_outbox_ops",
+    "mark_outbox_operation_applied",
+    "mark_outbox_operation_pending",
+    "mark_outbox_operation_superseded",
+    "record_applied_op",
+    "record_applied_operation",
+    "upsert_equipment_tombstone",
+    "upsert_tombstone",
+    "update_outbox_op",
+    "update_outbox_operation_status",
+]

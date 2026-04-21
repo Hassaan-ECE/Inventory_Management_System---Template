@@ -1,1 +1,1 @@
-"""TE Lab Equipment application package."""
+"""Shared runtime package for Lab Inventory template variants."""

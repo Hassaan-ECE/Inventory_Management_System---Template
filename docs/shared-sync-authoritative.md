@@ -8,31 +8,28 @@ Define the runtime contract where one shared database is authoritative and each 
 
 ## Storage Topology
 
-- Each source folder has its own local cache DB (resolved from runtime path rules and optional env override).
-- Two copied source folders on the same machine are a supported workflow; each keeps its own local cache while sharing the same authoritative DB.
-- The authoritative DB for the variant is `<shared_root>/shared/<shared_db_filename>`.
-- Variant folders provide configuration only; sync behavior is owned by `shared_core`.
-
-## Ownership Boundaries
-
-- `shared_core/Code/sync/` owns shared reachability checks, cache refresh behavior, and status reporting.
-- `shared_core/Code/db/` owns schema and snapshot/copy primitives used to keep local cache aligned to shared.
-- Variant folders (`ME_lab`, future labs) own only config values for shared root and DB filenames.
+- Each source folder has its own local cache DB.
+- The authoritative DB is `<shared_root>/shared/<shared_db_filename>`.
+- Multiple local source copies on one machine are supported; each keeps its own local cache.
 
 ## Runtime Expectations
 
-- Shared DB is the single source of truth.
-- Local DB is a cache copy used for startup, view, and search responsiveness.
-- Runtime does not depend on outbox/offline queues, tombstones, or `sync.lock`.
-- Edit/import operations are available only while shared is connected.
-- Disconnected mode remains open for view/search only; edit/import entry points are disabled.
-- Background sync loss is communicated through status bar messaging (no modal popup for disconnect state).
-- Update checks remain driven by shared release manifests (for example `current.json`).
+- Shared DB is source of truth when shared sync is enabled.
+- Local DB is cache for startup/view/search responsiveness.
+- Runtime does not rely on outbox replay or lock-file choreography for current shared-first flow.
+- Edit/import actions are available only while shared is reachable in shared-sync mode.
+- Disconnected mode remains open for view/search only.
+- Background sync loss is communicated through status bar messaging.
 
-## Test Migration Guidelines
+## Ownership Boundaries
 
-- Assert that shared snapshot state populates/refreshes local cache.
-- Assert that shared state remains authoritative over divergent local cache rows.
-- Remove assertions about queue replay, outbox counts, tombstone propagation, and lock-file behavior.
-- Add UI assertions that disconnected mode is view/search only with edit/import actions disabled.
-- Add UI assertions that background sync loss does not trigger modal popup warnings.
+- `Code/sync/` owns shared reachability checks, revision checks, and cache refresh behavior.
+- `Code/db/` owns schema and snapshot copy/replace primitives.
+- `Lab_Template/app_config.py` owns path/flag configuration only.
+
+## Testing Expectations
+
+- Verify shared snapshot refresh updates local cache correctly.
+- Verify unavailable/busy states produce non-blocking status behavior.
+- Verify mutation paths refresh local cache after shared writes.
+- Keep legacy queue/tombstone APIs callable for compatibility checks where needed.

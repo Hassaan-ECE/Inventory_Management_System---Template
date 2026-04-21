@@ -1,53 +1,37 @@
 # Module Ownership
 
-## Shared Modules
+## Shared Core (`shared_core/Code`)
 
-`shared_core/Code/db`
-- schema creation
-- snapshot state (`sync_state`)
-- equipment/import issue persistence
-- local snapshot replacement helpers
-- local cache read/write primitives used by shared-first sync
+`db/`
+- Owns schema, CRUD/search repositories, snapshot replacement/copy/import, sync-state persistence.
+- `database.py` is the compatibility facade for callers.
+- `legacy_sync_queue.py` APIs are compatibility-only and not runtime-critical for shared-first sync.
 
-`shared_core/Code/gui`
-- shared window shell
-- add/edit dialog contracts
-- quick-edit behavior
-- search/filtering
-- archive/verify/delete interaction
-- disconnected view/search mode and edit/import enablement rules
+`sync/`
+- Owns shared availability checks, revision checks, cache refresh behavior, and shared mutation orchestration.
+- `service.py` is the public sync facade.
+- `worker.py` owns the Qt background execution bridge.
 
-`shared_core/Code/importer`
-- workbook parsing
-- merge/full import orchestration
-- explicit import-to-db entry points for shared-connected operations
+`gui/`
+- Owns window shell, table behavior, dialogs, search/filter, and action routing.
+- `main_window.py` remains the integration point.
+- helper modules (`main_window_ui.py`, `main_window_sync.py`, `main_window_actions.py`, `main_window_search.py`) own extracted responsibilities.
 
-`shared_core/Code/sync`
-- shared-first cache sync service
-- worker-thread bridge for GUI calls
-- revision/checkpoint checks
-- shared reachability handling and local cache refresh behavior
-- update manifest lookup
+`importer/`
+- Owns workbook parsing, matching, dedupe/merge logic, and import persistence orchestration.
+- `pipeline.py` remains the public facade.
 
-## Variant Modules
+`reporting/`, `utils/`
+- Own shared export/report generation and runtime utility helpers.
 
-`ME_lab`
-- active variant config
-- ME workbook/source naming
-- packaging metadata
-- ME-focused tests
+## Template Wrapper (`Lab_Template`)
 
-`TE_Lab`
-- legacy reference config/tests
+Owns only variant-specific concerns:
 
-`Lab_Template`
-- starter variant config/tests
+- `app_config.py` metadata, import profile, feature flags, shared path settings
+- launcher/build wiring (`main.py`, `build.py`)
+- variant-local tests and local `Data/` assets
 
 ## Boundary Rule
 
-If a change affects more than one variant, it belongs in `shared_core` unless there is a concrete reason to keep it variant-specific.
-
-## Shared Core Ownership Rule
-
-- Any change to sync mechanics, local-cache refresh semantics, disconnected-mode UI behavior, or status-bar sync UX belongs under `shared_core/Code/`.
-- Variants should only configure paths, flags, naming, and packaging metadata through `app_config.py` and variant-local build wiring.
+If a change affects runtime behavior that should apply to more than one variant, it belongs in `shared_core/Code`, not inside the template wrapper.

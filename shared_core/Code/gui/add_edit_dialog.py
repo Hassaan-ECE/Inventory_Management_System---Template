@@ -138,7 +138,7 @@ class AddEditDialog(QDialog):
         return outer
 
     def _build_me_details_section(self) -> QWidget:
-        """ME-focused form section for parts and inventory records."""
+        """Compact-record form section for parts and inventory records."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -186,7 +186,7 @@ class AddEditDialog(QDialog):
         return container
 
     def _build_me_tracking_section(self) -> QWidget:
-        """ME-focused storage and tracking section."""
+        """Compact-record storage and tracking section."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -255,7 +255,7 @@ class AddEditDialog(QDialog):
         return container
 
     def _build_picture_section(self) -> QWidget:
-        """Picture path and preview fields used by the ME app."""
+        """Picture path and preview fields for image-enabled variants."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -772,12 +772,12 @@ def _format_quantity(value) -> str:
 
 
 def _uses_me_record_layout() -> bool:
-    """Return whether the current app should use the ME record layout."""
+    """Return whether the current app should use the compact record layout."""
     return bool(getattr(APP_CONFIG, "enable_project_field", False))
 
 
 def _uses_me_picture_section() -> bool:
-    """Return whether the current app should show the ME picture section."""
+    """Return whether the current app should show the compact-layout picture section."""
     return bool(
         getattr(APP_CONFIG, "enable_record_images", False)
         and not getattr(APP_CONFIG, "show_calibration_section", True)

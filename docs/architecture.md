@@ -1,51 +1,52 @@
 # Architecture
 
-## Shared Core First
+## Runtime Model
 
-The runtime lives in `shared_core/Code`. Variant folders should stay thin and carry only the pieces that truly differ:
+The runtime is shared-first:
 
-- `app_config.py`
-- launch/build wrappers
-- local `Data/`
-- variant-specific tests
-- variant-specific docs
+1. The shared database is authoritative when shared sync is enabled.
+2. The local database is a cache optimized for startup/view/search.
+3. UI remains usable for view/search when shared storage is unavailable.
+4. Mutations/imports are gated by shared availability in shared-sync mode.
 
-Everything else should default to shared-core ownership:
+## Code Ownership Boundary
 
-- database schema and helpers
-- import pipelines
-- GUI behavior
-- exports/reporting
-- sync and update checks
+- `shared_core/Code/` owns runtime behavior and contracts.
+- `Lab_Template/` owns variant configuration, launcher/build wiring, and variant tests.
 
-## Active Runtime Split
+## Runtime Module Layout
 
 - `Code/db/`
-  - SQLite schema
-  - search/index maintenance
-  - local snapshot helpers
-  - sync-state persistence primitives for local cache revision tracking
-  - record lookup/update primitives
-- `Code/gui/`
-  - main window and dialogs
-  - search/filter behavior
-  - table presentation and interaction
-  - disconnected view-only mode (edit/import actions disabled)
-- `Code/importer/`
-  - workbook parsing
-  - merge/full import orchestration
+  - `database.py` compatibility facade
+  - `schema.py` connection/table bootstrap
+  - `equipment_repo.py` equipment CRUD/search/stats
+  - `import_repo.py` raw-cell/import-issue persistence
+  - `snapshot_repo.py` snapshot fetch/replace/copy/import
+  - `sync_state_repo.py` revision/hash/client state
+  - `legacy_sync_queue.py` compatibility-only outbox/tombstone helpers
 - `Code/sync/`
-  - shared-first cache refresh service
-  - shared-to-local snapshot coordination
-  - Qt worker bridge for off-thread sync/import/mutation work
-  - update-manifest checks
+  - `service.py` public facade for sync operations
+  - `paths.py` path/shared-root resolution helpers
+  - `revision.py` status/revision checks
+  - `mutations.py` shared mutation/import helpers
+  - `worker.py` Qt thread bridge for background sync
+- `Code/gui/`
+  - `main_window.py` integration shell
+  - `main_window_ui.py` window sizing/ui helpers
+  - `main_window_sync.py` worker lifecycle helpers
+  - `main_window_actions.py` CRUD/import action handlers
+  - `main_window_search.py` search/filter result logic
+  - dialogs/table/theme/search helper modules
+- `Code/importer/`
+  - `pipeline.py` public import facade
+  - `pipeline_full.py` full-import strategy dispatch
+  - `pipeline_merge.py` merge-import strategy dispatch
+  - `pipeline_merge_helpers.py` merge/match/dedupe helpers
+  - parser modules (`master_parser`, `survey_parser`, `me_parser`) and normalizer/matching
 
-## Shared-First Cache Sync Flow
+## Public Interfaces Kept Stable
 
-1. Open the local SQLite cache for the current source copy.
-2. Resolve the variant shared DB path and treat it as the authoritative source of truth.
-3. Refresh local cache from shared in background sync cycles.
-4. Execute edits/imports only when shared is reachable; refresh local cache after shared writes.
-5. When shared is unavailable, keep view/search active while disabling edit/import actions.
-6. Communicate disconnected/busy state via status bar messaging; do not surface modal loss popups for background sync.
-7. Keep update checks tied to the shared release manifest.
+- `Code.db.database` import surface remains stable via facade re-exports.
+- `Code.sync.service` function signatures remain stable.
+- `Code.importer.pipeline` entry points remain stable.
+- `Lab_Template/main.py` keeps `main()` as the entrypoint.

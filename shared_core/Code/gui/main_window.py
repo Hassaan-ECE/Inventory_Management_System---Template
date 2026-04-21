@@ -56,6 +56,29 @@ from Code.gui.theme import (
     normalize_theme_name,
 )
 from Code.gui.quick_edit_dialog import QuickEditDialog
+from Code.gui.main_window_actions import (
+    submit_archive_change as _submit_archive_change_impl,
+    submit_create_equipment as _submit_create_equipment_impl,
+    submit_database_import as _submit_database_import_impl,
+    submit_delete_record as _submit_delete_record_impl,
+    submit_excel_import as _submit_excel_import_impl,
+    submit_toggle_verified as _submit_toggle_verified_impl,
+    submit_update_equipment as _submit_update_equipment_impl,
+)
+from Code.gui.main_window_search import (
+    clear_column_filters as _clear_column_filters_impl,
+    current_column_filter_values as _current_column_filter_values_impl,
+    do_search as _do_search_impl,
+    has_active_column_filters as _has_active_column_filters_impl,
+    schedule_search as _schedule_search_impl,
+    update_search_placeholder as _update_search_placeholder_impl,
+)
+from Code.gui.main_window_sync import (
+    run_shared_sync as _run_shared_sync_impl,
+    setup_sync_worker as _setup_sync_worker_impl,
+    teardown_sync_worker as _teardown_sync_worker_impl,
+)
+from Code.gui.main_window_ui import apply_initial_window_size as _apply_initial_window_size_impl
 from Code.gui.search_helpers import build_age_search_query, build_search_query
 from Code.gui.ui_components import CardWidget
 from Code.gui.window_branding import apply_window_branding
@@ -169,24 +192,7 @@ class MainWindow(QMainWindow):
 
     def _apply_initial_window_size(self) -> None:
         """Size the main window to the current display instead of assuming a large monitor."""
-        min_width = 960
-        min_height = 640
-        self.setMinimumSize(min_width, min_height)
-
-        screen = QGuiApplication.primaryScreen()
-        if screen is None:
-            self.resize(1280, 800)
-            return
-
-        available = screen.availableGeometry()
-        compact_display = available.width() <= 1920 or available.height() <= 1080
-
-        target_width = 1220 if compact_display else 1360
-        target_height = 760 if compact_display else 860
-
-        width = min(target_width, max(min_width, available.width() - 120))
-        height = min(target_height, max(min_height, available.height() - 120))
-        self.resize(width, height)
+        _apply_initial_window_size_impl(self)
 
     def _setup_ui(self) -> None:
         record_label = getattr(APP_CONFIG, "record_label", "Record").strip() or "Record"
@@ -414,43 +420,11 @@ class MainWindow(QMainWindow):
 
     def _setup_sync_worker(self) -> None:
         """Create a dedicated worker thread that owns sync runtime calls."""
-        if self._sync_worker is not None:
-            return
-
-        db_path = get_database_path(self.conn)
-        if db_path is None:
-            self.status_bar.showMessage("Shared sync unavailable: local database path not found.", 5000)
-            return
-
-        self._sync_thread = QThread(self)
-        self._sync_worker = GuiSyncWorker(db_path)
-        self._sync_worker.moveToThread(self._sync_thread)
-
-        self.request_startup_sync.connect(self._sync_worker.run_startup_sync)
-        self.request_sync.connect(self._sync_worker.run_sync)
-        self.request_revision_check.connect(self._sync_worker.run_revision_check)
-        self.request_reconnect.connect(self._sync_worker.run_reconnect)
-        self.request_shutdown_sync.connect(self._sync_worker.shutdown)
-
-        self._sync_worker.sync_completed.connect(self._on_sync_completed)
-        self._sync_worker.sync_failed.connect(self._on_sync_failed)
-        self._sync_worker.revision_checked.connect(self._on_revision_checked)
-        self._sync_worker.status_message.connect(self._on_worker_status_message)
-
-        self._sync_thread.start()
+        _setup_sync_worker_impl(self)
 
     def _teardown_sync_worker(self) -> None:
         """Stop and clean up the sync worker thread."""
-        if self._sync_worker is None or self._sync_thread is None:
-            return
-
-        self.request_shutdown_sync.emit()
-        self._sync_thread.quit()
-        self._sync_thread.wait(2500)
-        self._sync_worker.deleteLater()
-        self._sync_thread.deleteLater()
-        self._sync_worker = None
-        self._sync_thread = None
+        _teardown_sync_worker_impl(self)
 
     def _request_worker_sync(self, quiet: bool, reason: str) -> None:
         """Request a background sync run from the worker thread."""
@@ -596,182 +570,35 @@ class MainWindow(QMainWindow):
 
     def _submit_create_equipment(self, equipment: Equipment, action: str = "create") -> None:
         """Persist a new record through the active runtime path."""
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                create_equipment_shared(self.conn, equipment)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            self.status_bar.showMessage(self._mutation_success_message(action), 3000)
-            return
-        insert_equipment_local(self.conn, equipment)
-        self._do_search()
-        self._update_status_bar()
-        self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+        _submit_create_equipment_impl(self, equipment, action=action)
 
     def _submit_update_equipment(self, equipment: Equipment, action: str = "update") -> None:
         """Persist an updated record through the active runtime path."""
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                update_equipment_shared(self.conn, equipment)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            self.status_bar.showMessage(self._mutation_success_message(action), 3000)
-            return
-        update_equipment_local(self.conn, equipment)
-        self._do_search()
-        self._update_status_bar()
-        self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+        _submit_update_equipment_impl(self, equipment, action=action)
 
     def _submit_archive_change(self, record_uuid: str, archived: bool) -> None:
         """Persist archive-state changes through the appropriate runtime path."""
-        action = "archive" if archived else "restore"
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                set_archived_shared(self.conn, record_uuid, archived)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            self.status_bar.showMessage(self._mutation_success_message(action), 3000)
-            return
-        eq = self._equipment_for_record_uuid(record_uuid)
-        if eq is None:
-            raise KeyError(f"Equipment record not found: {record_uuid}")
-        eq.is_archived = archived
-        update_equipment_local(self.conn, eq)
-        self._do_search()
-        self._update_status_bar()
-        self.status_bar.showMessage(self._mutation_success_message(action), 3000)
+        _submit_archive_change_impl(self, record_uuid, archived)
 
     def _submit_delete_record(self, record_id: int, record_uuid: str) -> None:
         """Delete a record through the active runtime path."""
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                delete_equipment_shared(self.conn, record_uuid)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            self.status_bar.showMessage(self._mutation_success_message("delete"), 3000)
-            return
-        delete_equipment_local(self.conn, record_id)
-        self._do_search()
-        self._update_status_bar()
-        self.status_bar.showMessage(self._mutation_success_message("delete"), 3000)
+        _submit_delete_record_impl(self, record_id, record_uuid)
 
     def _submit_toggle_verified(self, record_uuid: str) -> None:
         """Toggle verification through the active runtime path."""
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                toggle_verified_shared(self.conn, record_uuid)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            self.status_bar.showMessage(self._mutation_success_message("verify"), 3000)
-            return
-        eq = self._equipment_for_record_uuid(record_uuid)
-        if eq is None:
-            raise KeyError(f"Equipment record not found: {record_uuid}")
-        eq.verified_in_survey = not eq.verified_in_survey
-        update_equipment_local(self.conn, eq)
-        self._do_search()
-        self._update_status_bar()
-        self.status_bar.showMessage(self._mutation_success_message("verify"), 3000)
+        _submit_toggle_verified_impl(self, record_uuid)
 
     def _submit_excel_import(self, data_dir: Path, mode: str = "merge") -> None:
         """Run an Excel import through the active runtime path."""
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                stats = run_excel_import_shared(self.conn, data_dir, mode=mode)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            QMessageBox.information(self, "Import Complete", self._format_import_success_message(f"excel_{mode}", stats))
-            return
-
-        from Code.importer.pipeline import run_merge_import, run_full_import
-
-        runner = run_merge_import if mode == "merge" else run_full_import
-        stats = runner(data_dir)
-        self._do_search()
-        self._update_status_bar()
-        QMessageBox.information(self, "Import Complete", self._format_import_success_message(f"excel_{mode}", stats))
+        _submit_excel_import_impl(self, data_dir, mode=mode)
 
     def _submit_database_import(self, source_path: Path) -> None:
         """Run a database import through the active runtime path."""
-        if shared_sync_enabled():
-            if not self._can_modify_records():
-                return
-            try:
-                stats = import_database_shared(self.conn, source_path)
-            except TimeoutError as exc:
-                self.status_bar.showMessage(str(exc) or "Shared workspace busy, retry in a moment.", 4000)
-                return
-            except ConnectionError as exc:
-                self._set_shared_actions_enabled(False)
-                self.status_bar.showMessage(str(exc) or "Shared workspace unavailable. Viewing local cache only.", 5000)
-                return
-            self._do_search()
-            self._update_status_bar()
-            QMessageBox.information(self, "Import Complete", self._format_import_success_message("db_snapshot", stats))
-            return
-
-        stats = import_database_snapshot_local(self.conn, source_path)
-        self._do_search()
-        self._update_status_bar()
-        QMessageBox.information(self, "Import Complete", self._format_import_success_message("db_snapshot", stats))
+        _submit_database_import_impl(self, source_path)
 
     def _schedule_search(self) -> None:
         """Debounce search/filter changes."""
-        self._timer.start()
+        _schedule_search_impl(self)
 
     def _toggle_theme(self) -> None:
         """Switch between the light and dark application themes."""
@@ -817,12 +644,7 @@ class MainWindow(QMainWindow):
 
     def _update_search_placeholder(self) -> None:
         """Update the search prompt to match the current record scope."""
-        if self._is_archive_view():
-            text = 'Search archived records — manufacturer, model, description, location, or notes'
-        else:
-            text = 'Search equipment — type anything: model, serial, manufacturer, location, "scrapped", "calibrated"...'
-        if hasattr(self, "search_input"):
-            self.search_input.setPlaceholderText(text)
+        _update_search_placeholder_impl(self)
 
     def _refresh_view_tabs(self) -> None:
         """Show the current inventory/archive counts on the top view tabs."""
@@ -942,85 +764,23 @@ class MainWindow(QMainWindow):
 
     def _run_shared_sync(self, quiet: bool = False) -> None:
         """Request a background revision check and pull when needed."""
-        if not shared_sync_enabled():
-            return
-        del quiet
-        self.request_revision_check.emit("periodic")
+        _run_shared_sync_impl(self, quiet=quiet)
 
     def _do_search(self) -> None:
         """Run the search query and populate the results table."""
-        query = self.search_input.text().strip()
-        filters = self._current_column_filter_values()
-        results = search_equipment(
-            self.conn,
-            query,
-            lifecycle=filters.get("lifecycle_status", ""),
-            calibration=filters.get("calibration_status", ""),
-            working=filters.get("working_status", ""),
-            location=filters.get("location", ""),
-            asset_number=filters.get("asset_number", ""),
-            manufacturer=filters.get("manufacturer", ""),
-            model=filters.get("model", ""),
-            description=filters.get("description", ""),
-            estimated_age_years=filters.get("estimated_age_years", ""),
-            archived=self._record_scope,
-        )
-        self.table.set_theme_name(self._theme_name)
-        self.table.set_color_rows_enabled(self.color_rows_checkbox.isChecked())
-        self.table.populate(results)
-        self._refresh_view_tabs()
-
-        count = len(results)
-        has_filters = self._has_active_column_filters()
-        record_label = "archived records" if self._is_archive_view() else "equipment records"
-        if not query:
-            if self._is_archive_view() and count == 0 and not has_filters:
-                self.results_label.setText("No archived records yet")
-            elif has_filters:
-                self.results_label.setText(f"Showing {count} filtered {record_label}")
-            else:
-                self.results_label.setText(f"Showing all {count} {record_label}")
-            self.not_found_widget.hide()
-        elif count > 0:
-            suffix = " after column filters" if has_filters else ""
-            if self._is_archive_view():
-                self.results_label.setText(
-                    f'{count} archived result{"s" if count != 1 else ""} for "{query}"{suffix}'
-                )
-            else:
-                self.results_label.setText(f'{count} result{"s" if count != 1 else ""} for "{query}"{suffix}')
-            self.not_found_widget.hide()
-        else:
-            if self._is_archive_view():
-                self.results_label.setText(f'No archived results for "{query}"')
-                self.not_found_widget.hide()
-            else:
-                self.results_label.setText(f'No results for "{query}"')
-                self.not_found_widget.show()
+        _do_search_impl(self)
 
     def _current_column_filter_values(self) -> dict[str, str]:
         """Return current per-column filter values in a DB-friendly shape."""
-        values: dict[str, str] = {}
-        for field, widget in self.column_filters.items():
-            if isinstance(widget, QComboBox):
-                value = widget.currentText().strip()
-                values[field] = "" if value.startswith("All ") else value
-            else:
-                values[field] = widget.text().strip()
-        return values
+        return _current_column_filter_values_impl(self)
 
     def _has_active_column_filters(self) -> bool:
         """Return whether any column filter currently has a value."""
-        return any(self._current_column_filter_values().values())
+        return _has_active_column_filters_impl(self)
 
     def _clear_column_filters(self) -> None:
         """Reset all per-column filter widgets."""
-        for widget in self.column_filters.values():
-            if isinstance(widget, QComboBox):
-                widget.setCurrentIndex(0)
-            else:
-                widget.clear()
-        self._do_search()
+        _clear_column_filters_impl(self)
 
     def _show_header_menu(self, position: QPoint) -> None:
         """Show a context menu for toggling visible table columns."""
@@ -1670,7 +1430,7 @@ def _show_age_search_actions() -> bool:
 
 
 def _uses_me_inventory_status() -> bool:
-    """Return whether the current app should use the simplified ME status summary."""
+    """Return whether the current app should use the simplified compact-layout status summary."""
     return bool(
         getattr(APP_CONFIG, "enable_project_field", False)
         and not getattr(APP_CONFIG, "show_calibration_section", True)

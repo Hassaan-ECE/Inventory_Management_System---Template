@@ -1,9 +1,0 @@
-For Machine Shop Inventory
-
-- use adityas excel list "Machine Shop Material List" in email as a reference
-- we will keep the app on the S:\Engineering\Public drive where we can make a folder for all different version TE, ME, IT .....
-- the plan for ME is to have quantity, Manufacturer, model, description, box No., location
-- then when we double click the entry it opens the detatiled view and it also has a place for its picture
-- the html we can keep as a seperate externally generated file where its easy to change the html to the use case
-- also we wanna have a per project seperation maybe another column or a divider? 
-- keep the current detailed excel export and make the search searchable for everything i believe currently it isnt since when i search te lab it doesnt filter

@@ -1,4 +1,4 @@
-"""Data models for TE Lab Equipment Inventory Manager."""
+"""Data models for the shared Lab Inventory runtime."""
 
 import json
 from dataclasses import dataclass

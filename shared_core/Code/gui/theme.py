@@ -1,4 +1,4 @@
-"""Shared application theme utilities for the TE Lab Equipment Inventory Manager."""
+"""Shared application theme utilities for the Lab Inventory runtime."""
 
 from pathlib import Path
 from string import Template

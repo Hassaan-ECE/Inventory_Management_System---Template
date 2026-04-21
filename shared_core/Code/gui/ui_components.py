@@ -1,4 +1,4 @@
-"""Reusable UI building blocks for the TE Lab Equipment Inventory Manager."""
+"""Reusable UI building blocks for the Lab Inventory runtime."""
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
