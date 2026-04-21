@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lab Inventory Review</title>
+  <style>
+    body { margin: 0; font-family: "Segoe UI", Tahoma, sans-serif; font-size: 16px; background: #f4f6f8; color: #16212b; }
+    .page { width: min(1800px, calc(100% - 16px)); margin: 16px auto 32px; }
+    .panel { background: #fff; border: 1px solid #d7dde5; padding: 20px; margin-top: 16px; }
+    .header { border-top: 6px solid #1f4e79; }
+    h1 { margin: 0 0 10px; color: #173954; font-size: 2.1rem; }
+    h2 { margin: 0 0 8px; color: #173954; font-size: 1.32rem; }
+    p { margin: 0; line-height: 1.6; }
+    .subtext { color: #44515f; margin-top: 8px; }
+    .meta { margin-top: 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 20px; }
+    .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; margin-top: 16px; }
+    .metric { grid-column: span 3; min-height: 110px; }
+    .span-5 { grid-column: span 5; }
+    .span-7 { grid-column: span 7; }
+    .span-12 { grid-column: 1 / -1; }
+    .label { color: #44515f; text-transform: uppercase; letter-spacing: 0.06em; font-size: 0.96rem; }
+    .value { display: block; margin-top: 10px; color: #173954; font-size: 2rem; font-weight: 700; }
+    .note { margin-top: 8px; color: #44515f; font-size: 1rem; }
+    .table-shell { overflow: auto; border: 1px solid #d7dde5; margin-top: 12px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #d7dde5; vertical-align: top; font-size: 0.98rem; }
+    th { background: #eef3f8; color: #173954; font-size: 0.93rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    tbody tr:nth-child(even) { background: #fafbfd; }
+    .status { display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 0.92rem; font-weight: 600; white-space: nowrap; }
+    .status.immediate { background: #fde8e8; color: #9b1c1c; }
+    .status.high { background: #fff3db; color: #8a4b08; }
+    .status.planned { background: #fff8cc; color: #7c5a00; }
+    .status.monitor { background: #edf2f7; color: #3f4d5f; }
+    .status.routine { background: #e8f4ec; color: #216e39; }
+    .priority-row.immediate td { background: #fff1f1; }
+    .priority-row.high td { background: #fff7ea; }
+    .priority-row.planned td { background: #fffbe6; }
+    .priority-row.monitor td { background: #f3f6f9; }
+    .priority-row.routine td { background: #eef7f0; }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+    .toolbar > div:first-child { display: flex; flex-direction: column; justify-content: center; gap: 4px; }
+    .toolbar input { width: 240px; min-width: 240px; border: 1px solid #b8c4d0; padding: 10px 12px; font: inherit; color: #16212b; background: #fff; }
+    .toolbar-buttons { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; margin-left: auto; }
+    .toolbar button { border: 1px solid #b8c4d0; background: #fff; color: #173954; padding: 9px 12px; font: inherit; cursor: pointer; white-space: nowrap; }
+    .toolbar button:hover { background: #eef3f8; }
+    .selection-count { color: #44515f; font-size: 1rem; }
+    .panel-toggle { display: none; margin-top: 12px; padding: 14px; background: #f8fbfd; border: 1px solid #d7dde5; }
+    .panel-toggle.is-open { display: block; }
+    .filter-grid, .column-grid { display: grid; gap: 10px 12px; }
+    .filter-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .column-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .filter-grid label, .column-grid label { display: flex; flex-direction: column; gap: 6px; font-size: 0.96rem; color: #2f3b47; }
+    .column-grid label { flex-direction: row; align-items: center; }
+    .filter-grid input, .filter-grid select { border: 1px solid #b8c4d0; padding: 8px 10px; font: inherit; color: #16212b; background: #fff; }
+    #verifiedTable { table-layout: fixed; font-size: 0.9rem; min-width: 1500px; }
+    #verifiedTable th, #verifiedTable td { padding: 7px 9px; line-height: 1.28; white-space: normal; overflow-wrap: anywhere; }
+    #verifiedTable .status { padding: 2px 6px; font-size: 0.82rem; }
+    #verifiedTable th { position: relative; user-select: none; }
+    #verifiedTable .select-col, #verifiedTable .select-cell { width: 42px; text-align: center; }
+    #verifiedTable .resize-handle { position: absolute; top: 0; right: 0; width: 14px; height: 100%; cursor: col-resize; }
+    #verifiedTable .resize-handle::before { content: ""; position: absolute; left: 5px; top: 8px; bottom: 8px; width: 2px; background: #9aa7b5; border-radius: 999px; box-shadow: 0 0 0 1px #f7f9fb; }
+    #verifiedTable th:hover .resize-handle::before, #verifiedTable .resize-handle:hover::before { background: #1f4e79; }
+    #verifiedTable .sort-button { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 0 22px 0 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+    #verifiedTable .sort-button:focus-visible { outline: 2px solid #1f4e79; outline-offset: 2px; }
+    #verifiedTable .header-label { display: block; }
+    #verifiedTable .sort-indicator { color: #5f6c7b; font-size: 0.85rem; }
+    #verifiedTable th[aria-sort="ascending"] .sort-indicator::before { content: "\25B2"; }
+    #verifiedTable th[aria-sort="descending"] .sort-indicator::before { content: "\25BC"; }
+    #verifiedTable th[aria-sort="none"] .sort-indicator::before { content: "\2195"; }
+    #verifiedTable input[type="checkbox"] { width: 14px; height: 14px; }
+    .col-hidden { display: none; }
+    .empty-state { text-align: center; color: #5f6c7b; padding: 24px 12px; }
+    @media (max-width: 1000px) { .metric, .span-5, .span-7 { grid-column: span 6; } }
+    @media (max-width: 720px) {
+      .page { width: min(100% - 12px, 1800px); margin-top: 8px; }
+      .panel { padding: 16px; }
+      .meta, .metric, .span-5, .span-7, .span-12 { grid-column: 1 / -1; }
+      .filter-grid, .column-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toolbar-buttons { flex-wrap: wrap; justify-content: flex-start; margin-left: 0; }
+      .toolbar input { width: 100%; min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="panel header">
+      <h1>Lab Inventory Review</h1>
+    </section>
+
+    <section class="grid">
+      <article class="panel metric"><div class="label">Verified Equipment</div><span class="value">0</span><div class="note">Total verified units included in this review.</div></article>
+      <article class="panel metric"><div class="label">Average Age</div><span class="value">N/A</span><div class="note">Average estimated age in years.</div></article>
+      <article class="panel metric"><div class="label">30+ Years Old</div><span class="value">0</span><div class="note">Units that should be part of near-term replacement planning.</div></article>
+      <article class="panel metric"><div class="label">Immediate Review</div><span class="value">0</span><div class="note">Units marked scrapped or not working.</div></article>
+
+      <article class="panel span-5">
+        <h2>Age Distribution</h2>
+        <p class="subtext">This shows how much of the verified inventory sits in older age bands.</p>
+        <div class="table-shell"><table><thead><tr><th>Age Band</th><th>Count</th></tr></thead><tbody><tr><td>40+ years</td><td>0</td></tr><tr><td>30-39 years</td><td>0</td></tr><tr><td>20-29 years</td><td>0</td></tr><tr><td>10-19 years</td><td>0</td></tr><tr><td>Under 10 years</td><td>0</td></tr><tr><td>Age not available</td><td>0</td></tr></tbody></table></div>
+      </article>
+
+      <article class="panel span-7">
+        <h2>Manager Action Summary</h2>
+        <p class="subtext">These categories summarize what likely needs replacement, recycle, or closer review.</p>
+        <div class="table-shell"><table><thead><tr><th>Action Category</th><th>Count</th><th>Meaning</th></tr></thead><tbody><tr><td><span class="status immediate">Immediate</span></td><td>0</td><td>Scrapped or not working. Decide quickly whether to recycle, replace, or repair.</td></tr><tr><td><span class="status high">High</span></td><td>0</td><td>Very old equipment. Replacement should be prioritized soon.</td></tr><tr><td><span class="status planned">Planned</span></td><td>0</td><td>Old enough that it should be included in the budget pipeline.</td></tr><tr><td><span class="status monitor">Monitor</span></td><td>0</td><td>Older or uncertain condition. Review before the next budget cycle.</td></tr><tr><td><span class="status routine">Routine</span></td><td>0</td><td>No strong replacement signal from current age and status fields alone.</td></tr></tbody></table></div>
+      </article>
+
+      <article class="panel span-12">
+        <h2>Oldest Verified Equipment</h2>
+        <div class="table-shell"><table><thead><tr><th>Age</th><th>Working</th><th>Lifecycle</th><th>Manufacturer</th><th>Model</th><th>Description</th><th>Serial Number</th><th>Location</th></tr></thead><tbody><tr><td colspan="8" class="empty-state">No verified equipment found.</td></tr></tbody></table></div>
+      </article>
+
+      <article class="panel span-5">
+        <h2>Verified Equipment by Location</h2>
+        <p class="subtext">Useful when replacement decisions depend on where the equipment is being used.</p>
+        <div class="table-shell"><table><thead><tr><th>Location</th><th>Count</th></tr></thead><tbody><tr><td colspan="2" class="empty-state">No verified equipment found.</td></tr></tbody></table></div>
+      </article>
+
+      <article class="panel span-7">
+        <h2>Condition Snapshot</h2>
+        <p class="subtext">Quick counts for working and lifecycle status in the verified set.</p>
+        <div class="table-shell"><table><thead><tr><th>Measure</th><th>Count</th></tr></thead><tbody>
+          <tr><td>Working</td><td>0</td></tr>
+          <tr><td>Not Working</td><td>0</td></tr>
+          <tr><td>Limited</td><td>0</td></tr>
+          <tr><td>Unknown Working Status</td><td>0</td></tr>
+          <tr><td>Active Lifecycle</td><td>0</td></tr>
+          <tr><td>Scrapped Lifecycle</td><td>0</td></tr>
+          <tr><td>20+ Years Old</td><td>0</td></tr>
+          <tr><td>30+ Years Old</td><td>0</td></tr>
+        </tbody></table></div>
+      </article>
+
+      <article class="panel span-12">
+        <div class="toolbar">
+          <div>
+            <h2>Full Verified Equipment Detail</h2>
+            <div class="selection-count" id="selectionCount">0 selected</div>
+          </div>
+          <div class="toolbar-buttons">
+            <button type="button" id="toggleFilters">Filters</button>
+            <button type="button" id="toggleColumns">Columns</button>
+            <button type="button" id="clearSelection">Clear Selection</button>
+            <input id="tableFilter" type="search" placeholder="Search">
+          </div>
+        </div>
+        <div class="panel-toggle" id="filtersPanel">
+          <div class="filter-grid">
+            <label>Age<input class="column-filter" data-column="age" type="text"></label><label>Working<select class="column-filter" data-column="working"><option value="">All</option><option value="Working">Working</option><option value="Limited">Limited</option><option value="Not Working">Not Working</option><option value="Unknown">Unknown</option></select></label><label>Lifecycle<select class="column-filter" data-column="lifecycle"><option value="">All</option><option value="Active">Active</option><option value="Repair">Repair</option><option value="Scrapped">Scrapped</option><option value="Missing">Missing</option><option value="Rental">Rental</option></select></label><label>Manufacturer<input class="column-filter" data-column="manufacturer" type="text"></label><label>Model<input class="column-filter" data-column="model" type="text"></label><label>Description<input class="column-filter" data-column="description" type="text"></label><label>Serial Number<input class="column-filter" data-column="serial" type="text"></label><label>Location<input class="column-filter" data-column="location" type="text"></label><label>Assigned To<input class="column-filter" data-column="assigned_to" type="text"></label><label>Cal Status<select class="column-filter" data-column="cal_status"><option value="">All</option><option value="Calibrated">Calibrated</option><option value="Reference Only">Reference Only</option><option value="Out To Cal">Out To Cal</option><option value="Unknown">Unknown</option></select></label><label>Blue Dot<input class="column-filter" data-column="blue_dot" type="text"></label><label>Notes<input class="column-filter" data-column="notes" type="text"></label>
+          </div>
+        </div>
+        <div class="panel-toggle" id="columnsPanel">
+          <div class="column-grid">
+            <label><input class="column-toggle" data-column="age" type="checkbox" checked> Age</label><label><input class="column-toggle" data-column="working" type="checkbox" checked> Working</label><label><input class="column-toggle" data-column="lifecycle" type="checkbox" checked> Lifecycle</label><label><input class="column-toggle" data-column="manufacturer" type="checkbox" checked> Manufacturer</label><label><input class="column-toggle" data-column="model" type="checkbox" checked> Model</label><label><input class="column-toggle" data-column="description" type="checkbox" checked> Description</label><label><input class="column-toggle" data-column="serial" type="checkbox" checked> Serial Number</label><label><input class="column-toggle" data-column="location" type="checkbox" checked> Location</label><label><input class="column-toggle" data-column="assigned_to" type="checkbox" checked> Assigned To</label><label><input class="column-toggle" data-column="cal_status" type="checkbox" checked> Cal Status</label><label><input class="column-toggle" data-column="blue_dot" type="checkbox" checked> Blue Dot</label><label><input class="column-toggle" data-column="notes" type="checkbox" checked> Notes</label>
+          </div>
+        </div>
+        <div class="table-shell"><table id="verifiedTable"><colgroup><col class="select-col" style="width: 42px;"><col class="col-age" data-column="age" style="width: 74px;"><col class="col-working" data-column="working" style="width: 90px;"><col class="col-lifecycle" data-column="lifecycle" style="width: 90px;"><col class="col-manufacturer" data-column="manufacturer" style="width: 130px;"><col class="col-model" data-column="model" style="width: 120px;"><col class="col-description" data-column="description" style="width: 190px;"><col class="col-serial" data-column="serial" style="width: 130px;"><col class="col-location" data-column="location" style="width: 130px;"><col class="col-assigned_to" data-column="assigned_to" style="width: 105px;"><col class="col-cal_status" data-column="cal_status" style="width: 110px;"><col class="col-blue_dot" data-column="blue_dot" style="width: 88px;"><col class="col-notes" data-column="notes" style="width: 165px;"></colgroup><thead><tr><th class="select-col"><input type="checkbox" id="selectAllRows"></th><th class="col-age" data-column="age" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Age</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-working" data-column="working" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Working</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-lifecycle" data-column="lifecycle" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Lifecycle</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-manufacturer" data-column="manufacturer" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Manufacturer</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-model" data-column="model" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Model</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-description" data-column="description" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Description</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-serial" data-column="serial" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Serial Number</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-location" data-column="location" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Location</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-assigned_to" data-column="assigned_to" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Assigned To</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-cal_status" data-column="cal_status" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Cal Status</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-blue_dot" data-column="blue_dot" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Blue Dot</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th><th class="col-notes" data-column="notes" data-resizable="true" data-sortable="true" aria-sort="none"><button type="button" class="sort-button"><span class="header-label">Notes</span><span class="sort-indicator" aria-hidden="true"></span></button><span class="resize-handle"></span></th></tr></thead><tbody><tr><td colspan="13" class="empty-state">No verified equipment found.</td></tr></tbody></table></div>
+      </article>
+    </section>
+  </main>
+  <script>
+    const filterInput = document.getElementById("tableFilter");
+    const tableRows = Array.from(document.querySelectorAll("#verifiedTable tbody tr"));
+    const detailTable = document.getElementById("verifiedTable");
+    const detailTableBody = detailTable.querySelector("tbody");
+    const filtersPanel = document.getElementById("filtersPanel");
+    const columnsPanel = document.getElementById("columnsPanel");
+    const selectionCount = document.getElementById("selectionCount");
+    const selectAllRows = document.getElementById("selectAllRows");
+    const rowCheckboxes = Array.from(document.querySelectorAll(".row-select"));
+    const filterControls = Array.from(document.querySelectorAll(".column-filter"));
+    const columnToggles = Array.from(document.querySelectorAll(".column-toggle"));
+    const sortableHeaders = Array.from(document.querySelectorAll("#verifiedTable th[data-sortable='true']"));
+    const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+    const numericColumns = new Set(["age", "blue_dot"]);
+    let activeSort = { columnKey: null, direction: "ascending" };
+
+    function updateSelectionCount() {
+      const selected = rowCheckboxes.filter((box) => box.checked).length;
+      selectionCount.textContent = `${selected} selected`;
+    }
+
+    function applyFilters() {
+      const query = filterInput.value.trim().toLowerCase();
+      tableRows.forEach((row) => {
+        let visible = row.innerText.toLowerCase().includes(query);
+        if (visible) {
+          for (const control of filterControls) {
+            const key = control.dataset.column;
+            const value = control.value.trim().toLowerCase();
+            if (!value) {
+              continue;
+            }
+            const cell = row.querySelector(`[data-column="${key}"]`);
+            const text = cell ? cell.innerText.trim().toLowerCase() : "";
+            const isSelectFilter = control.tagName === "SELECT";
+            if ((isSelectFilter && text !== value) || (!isSelectFilter && !text.includes(value))) {
+              visible = false;
+              break;
+            }
+          }
+        }
+        row.style.display = visible ? "" : "none";
+      });
+      const visibleRows = tableRows.filter((row) => row.style.display !== "none");
+      const allVisibleSelected = visibleRows.length > 0 && visibleRows.every((row) => row.querySelector(".row-select").checked);
+      selectAllRows.checked = allVisibleSelected;
+      selectAllRows.indeterminate = visibleRows.length > 0 && !allVisibleSelected && visibleRows.some((row) => row.querySelector(".row-select").checked);
+    }
+
+    function setColumnVisibility(columnKey, visible) {
+      document.querySelectorAll(`.col-${columnKey}`).forEach((cell) => {
+        cell.classList.toggle("col-hidden", !visible);
+      });
+      document.querySelectorAll(`col[data-column="${columnKey}"]`).forEach((col) => {
+        col.style.display = visible ? "" : "none";
+      });
+    }
+
+    function cellText(row, columnKey) {
+      const cell = row.querySelector(`[data-column="${columnKey}"]`);
+      if (!cell) {
+        return "";
+      }
+      const text = cell.textContent.trim();
+      return text === "-" ? "" : text;
+    }
+
+    function updateSortIndicators(columnKey, direction) {
+      sortableHeaders.forEach((header) => {
+        const ariaSort = header.dataset.column === columnKey ? direction : "none";
+        header.setAttribute("aria-sort", ariaSort);
+      });
+    }
+
+    function sortDetailRows(columnKey, direction) {
+      const sorted = [...tableRows].sort((rowA, rowB) => {
+        const valueA = cellText(rowA, columnKey);
+        const valueB = cellText(rowB, columnKey);
+
+        if (numericColumns.has(columnKey)) {
+          const numberA = Number.parseFloat(valueA);
+          const numberB = Number.parseFloat(valueB);
+          const aIsNumber = Number.isFinite(numberA);
+          const bIsNumber = Number.isFinite(numberB);
+
+          if (aIsNumber && bIsNumber && numberA !== numberB) {
+            return direction === "ascending" ? numberA - numberB : numberB - numberA;
+          }
+          if (aIsNumber !== bIsNumber) {
+            return aIsNumber ? -1 : 1;
+          }
+        }
+
+        const comparison = collator.compare(valueA, valueB);
+        return direction === "ascending" ? comparison : -comparison;
+      });
+
+      detailTableBody.append(...sorted);
+      activeSort = { columnKey, direction };
+      updateSortIndicators(columnKey, direction);
+    }
+
+    document.getElementById("toggleFilters").addEventListener("click", () => {
+      filtersPanel.classList.toggle("is-open");
+    });
+
+    document.getElementById("toggleColumns").addEventListener("click", () => {
+      columnsPanel.classList.toggle("is-open");
+    });
+
+    document.getElementById("clearSelection").addEventListener("click", () => {
+      rowCheckboxes.forEach((box) => {
+        box.checked = false;
+      });
+      selectAllRows.checked = false;
+      selectAllRows.indeterminate = false;
+      updateSelectionCount();
+    });
+
+    filterInput.addEventListener("input", applyFilters);
+    filterControls.forEach((control) => control.addEventListener("input", applyFilters));
+    filterControls.forEach((control) => control.addEventListener("change", applyFilters));
+    columnToggles.forEach((toggle) => toggle.addEventListener("change", (event) => {
+      setColumnVisibility(event.target.dataset.column, event.target.checked);
+    }));
+    sortableHeaders.forEach((header) => {
+      const button = header.querySelector(".sort-button");
+      if (!button) {
+        return;
+      }
+      button.addEventListener("click", () => {
+        const columnKey = header.dataset.column;
+        const direction =
+          activeSort.columnKey === columnKey && activeSort.direction === "ascending"
+            ? "descending"
+            : "ascending";
+        sortDetailRows(columnKey, direction);
+      });
+    });
+
+    selectAllRows.addEventListener("change", () => {
+      tableRows.forEach((row) => {
+        if (row.style.display === "none") {
+          return;
+        }
+        row.querySelector(".row-select").checked = selectAllRows.checked;
+      });
+      updateSelectionCount();
+    });
+
+    rowCheckboxes.forEach((box) => box.addEventListener("change", () => {
+      updateSelectionCount();
+      applyFilters();
+    }));
+
+    document.querySelectorAll("#verifiedTable th[data-resizable='true']").forEach((header) => {
+      const handle = header.querySelector(".resize-handle");
+      const key = header.dataset.column;
+      if (!handle || !key) {
+        return;
+      }
+      handle.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        const startX = event.clientX;
+        const col = document.querySelector(`col[data-column="${key}"]`);
+        const startWidth = col ? (parseFloat(col.style.width) || header.offsetWidth) : header.offsetWidth;
+        const onMove = (moveEvent) => {
+          const nextWidth = Math.max(60, startWidth + (moveEvent.clientX - startX));
+          if (col) {
+            col.style.width = `${nextWidth}px`;
+          }
+        };
+        const onUp = () => {
+          window.removeEventListener("mousemove", onMove);
+          window.removeEventListener("mouseup", onUp);
+        };
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+      });
+    });
+
+    updateSelectionCount();
+    applyFilters();
+  </script>
+</body>
+</html>
